@@ -1,0 +1,2885 @@
+diff -ruN hal_a/MappedInputManager.cpp hal_b/MappedInputManager.cpp
+--- hal_a/MappedInputManager.cpp	2026-07-16 23:12:38.022461084 +0000
++++ hal_b/MappedInputManager.cpp	2026-07-16 23:12:38.023771794 +0000
+@@ -1,20 +1,25 @@
+ #include "MappedInputManager.h"
+ 
+-#include <GfxRenderer.h>
+-
+ #include "CrossPointSettings.h"
+ 
+-bool MappedInputManager::isNavDirectionSwapped() const {
+-  // Key the swap on the orientation the screen is *actually* rendered at, not the persisted reader
+-  // setting. The reader (and its modal menus) render rotated, so navigation/labels flip there; the
+-  // home and settings UI render in portrait, so they never flip even when a rotated reader is configured.
+-  const auto orientation = renderer.getOrientation();
+-  return SETTINGS.frontButtonFollowOrientation &&
+-         (orientation == GfxRenderer::PortraitInverted || orientation == GfxRenderer::LandscapeCounterClockwise);
+-}
++namespace {
++using ButtonIndex = uint8_t;
++
++struct SideLayoutMap {
++  ButtonIndex pageBack;
++  ButtonIndex pageForward;
++};
++
++// Order matches CrossPointSettings::SIDE_BUTTON_LAYOUT.
++constexpr SideLayoutMap kSideLayouts[] = {
++    {HalGPIO::BTN_UP, HalGPIO::BTN_DOWN},
++    {HalGPIO::BTN_DOWN, HalGPIO::BTN_UP},
++};
++}  // namespace
+ 
+ bool MappedInputManager::mapButton(const Button button, bool (HalGPIO::*fn)(uint8_t) const) const {
+-  const auto sideLayout = SETTINGS.sideButtonLayout;
++  const auto sideLayout = static_cast<CrossPointSettings::SIDE_BUTTON_LAYOUT>(SETTINGS.sideButtonLayout);
++  const auto& side = kSideLayouts[sideLayout];
+ 
+   switch (button) {
+     case Button::Back:
+@@ -40,35 +45,10 @@
+       return (gpio.*fn)(HalGPIO::BTN_POWER);
+     case Button::PageBack:
+       // Reader page navigation uses side buttons and can be swapped via settings.
+-      switch (sideLayout) {
+-        case CrossPointSettings::PREV_NEXT:
+-          return (gpio.*fn)(HalGPIO::BTN_UP);
+-        case CrossPointSettings::NEXT_PREV:
+-          return (gpio.*fn)(HalGPIO::BTN_DOWN);
+-        case CrossPointSettings::SIDE_BUTTONS_DISABLED:
+-        default:
+-          return false;
+-      }
++      return (gpio.*fn)(side.pageBack);
+     case Button::PageForward:
+       // Reader page navigation uses side buttons and can be swapped via settings.
+-      switch (sideLayout) {
+-        case CrossPointSettings::PREV_NEXT:
+-          return (gpio.*fn)(HalGPIO::BTN_DOWN);
+-        case CrossPointSettings::NEXT_PREV:
+-          return (gpio.*fn)(HalGPIO::BTN_UP);
+-        case CrossPointSettings::SIDE_BUTTONS_DISABLED:
+-        default:
+-          return false;
+-      }
+-    case Button::NavNext:
+-      // Logical "next item" navigation: side Down + front Right, with the control axis flipped in
+-      // INVERTED / LANDSCAPE_CCW (frontButtonFollowOrientation) so it matches the rotated hint labels.
+-      return isNavDirectionSwapped() ? (mapButton(Button::Up, fn) || mapButton(Button::Left, fn))
+-                                     : (mapButton(Button::Down, fn) || mapButton(Button::Right, fn));
+-    case Button::NavPrevious:
+-      // Logical "previous item" navigation: side Up + front Left, axis-flipped in the same orientations.
+-      return isNavDirectionSwapped() ? (mapButton(Button::Down, fn) || mapButton(Button::Right, fn))
+-                                     : (mapButton(Button::Up, fn) || mapButton(Button::Left, fn));
++      return (gpio.*fn)(side.pageForward);
+   }
+ 
+   return false;
+@@ -88,11 +68,6 @@
+ 
+ MappedInputManager::Labels MappedInputManager::mapLabels(const char* back, const char* confirm, const char* previous,
+                                                          const char* next) const {
+-  // Swap previous/next labels to match the page turn direction swap in INVERTED and LANDSCAPE_CCW.
+-  const bool swapLabels = isNavDirectionSwapped();
+-  const char* leftLabel = swapLabels ? next : previous;
+-  const char* rightLabel = swapLabels ? previous : next;
+-
+   // Build the label order based on the configured hardware mapping.
+   auto labelForHardware = [&](uint8_t hw) -> const char* {
+     // Compare against configured logical roles and return the matching label.
+@@ -103,10 +78,10 @@
+       return confirm;
+     }
+     if (hw == SETTINGS.frontButtonLeft) {
+-      return leftLabel;
++      return previous;
+     }
+     if (hw == SETTINGS.frontButtonRight) {
+-      return rightLabel;
++      return next;
+     }
+     return "";
+   };
+@@ -131,4 +106,4 @@
+     return HalGPIO::BTN_RIGHT;
+   }
+   return -1;
+-}
++}
+\ No newline at end of file
+diff -ruN hal_a/MappedInputManager.h hal_b/MappedInputManager.h
+--- hal_a/MappedInputManager.h	2026-07-16 23:12:38.022484702 +0000
++++ hal_b/MappedInputManager.h	2026-07-16 23:12:38.023947588 +0000
+@@ -2,11 +2,9 @@
+ 
+ #include <HalGPIO.h>
+ 
+-class GfxRenderer;
+-
+ class MappedInputManager {
+  public:
+-  enum class Button { Back, Confirm, Left, Right, Up, Down, Power, PageBack, PageForward, NavNext, NavPrevious };
++  enum class Button { Back, Confirm, Left, Right, Up, Down, Power, PageBack, PageForward };
+ 
+   struct Labels {
+     const char* btn1;
+@@ -15,9 +13,30 @@
+     const char* btn4;
+   };
+ 
+-  MappedInputManager(HalGPIO& gpio, const GfxRenderer& renderer) : gpio(gpio), renderer(renderer) {}
++  explicit MappedInputManager(HalGPIO& gpio) : gpio(gpio) {}
+ 
+   void update() const { gpio.update(); }
++  void clearState() const { gpio.clearState(); }
++
++  // Raw touch coordinate access for tap-to-select navigation
++  int16_t getTouchX() const { return gpio.getLastTouchX(); }
++  int16_t getTouchY() const { return gpio.getLastTouchY(); }
++  // Footer nav bar height — forwarded to HalGPIO for touch zone mapping.
++  void setFooterHeight(int16_t height) { gpio.setFooterHeight(height); }
++  void setTouchOrientation(uint8_t orientation) { gpio.setTouchOrientation(orientation); }
++
++  // Returns true if any single-finger tap was released in a reader zone.
++  // Only active in reader/keyboard mode (footerHeight == 0); in footer mode
++  // all navigation goes through the footer buttons, so this returns false.
++  bool wasTapped() const {
++    if (gpio.getFooterHeight() > 0) return false;
++    // On the release frame, BTN_TWO_FINGER / BTN_SWIPE_* are SET in currentState
++    // while the zone button transitions from previousState, so use isPressed guards.
++    if (gpio.isPressed(HalGPIO::BTN_TWO_FINGER)) return false;
++    if (gpio.isPressed(HalGPIO::BTN_SWIPE_UP) || gpio.isPressed(HalGPIO::BTN_SWIPE_DOWN)) return false;
++    return gpio.wasReleased(HalGPIO::BTN_LEFT) || gpio.wasReleased(HalGPIO::BTN_CONFIRM) ||
++           gpio.wasReleased(HalGPIO::BTN_RIGHT);
++  }
+   bool wasPressed(Button button) const;
+   bool wasReleased(Button button) const;
+   bool isPressed(Button button) const;
+@@ -28,20 +47,8 @@
+   // Returns the raw front button index that was pressed this frame (or -1 if none).
+   int getPressedFrontButton() const;
+ 
+-  // True when the control axis is flipped relative to the physical buttons: the user opted into
+-  // orientation-following front buttons AND the screen is *currently rendered* rotated (INVERTED /
+-  // LANDSCAPE_CCW). Keyed on the live renderer orientation rather than the persisted reader setting,
+-  // so portrait UI (home, settings) never swaps while the reader and its menus do.
+-  [[nodiscard]] bool isNavDirectionSwapped() const;
+-
+  private:
+   HalGPIO& gpio;
+-  // Logical-to-physical button mapping depends on what the user is actually looking at: when the
+-  // screen is rendered rotated, the directional buttons must flip to match. The renderer is the only
+-  // authority on the *live* orientation (the reader rotates it and restores portrait on exit), so we
+-  // read it here instead of CrossPointSettings.orientation, which is just the persisted reader
+-  // preference and stays "rotated" even while portrait UI like home/settings is on screen.
+-  const GfxRenderer& renderer;
+ 
+   bool mapButton(Button button, bool (HalGPIO::*fn)(uint8_t) const) const;
+ };
+diff -ruN hal_a/hal/HalClock.cpp hal_b/hal/HalClock.cpp
+--- hal_a/hal/HalClock.cpp	2026-07-16 23:12:38.010381802 +0000
++++ hal_b/hal/HalClock.cpp	2026-07-16 23:12:38.011685124 +0000
+@@ -2,47 +2,59 @@
+ 
+ #include <Logging.h>
+ #include <WiFi.h>
++#include <Wire.h>
+ #include <esp_sntp.h>
+ #include <time.h>
+ 
+-#include <cassert>
+-
+ HalClock halClock;  // Singleton instance
+ 
+-// DS3231 register layout (BCD encoded):
+-//   0x00: Seconds  (bits 6-4 = tens, bits 3-0 = ones)
+-//   0x01: Minutes  (bits 6-4 = tens, bits 3-0 = ones)
+-//   0x02: Hours    (bit 6 = 12/24 mode, bits 5-4 = tens, bits 3-0 = ones)
+-
+-static uint8_t bcdToDec(uint8_t bcd) { return ((bcd >> 4) * 10) + (bcd & 0x0F); }
+-static uint8_t decToBcd(uint8_t dec) { return ((dec / 10) << 4) | (dec % 10); }
++// BM8563 (PCF8563-compatible) lives on M5PaperS3's I2C1, the same physical bus
++// as the GT911 touch controller (SDA=GPIO41, SCL=GPIO42). The lgfx GT911
++// driver installs the ESP-IDF I2C master on port 1 during HalTouch::begin;
++// we re-bind Wire1 to the same pins here so Arduino-level I2C transactions
++// can talk to the RTC without disturbing touch.
++namespace {
++constexpr uint8_t BM8563_ADDR = 0x51;
++constexpr int BM8563_SDA_PIN = 41;
++constexpr int BM8563_SCL_PIN = 42;
++constexpr uint32_t BM8563_FREQ = 400000;
++
++// BM8563 register map (PCF8563 family). All time fields are BCD.
++//   0x02  Seconds   (bit 7 = VL — set when voltage was low; time invalid)
++//   0x03  Minutes
++//   0x04  Hours     (24-hour mode, bits 5-0)
++constexpr uint8_t REG_SECONDS = 0x02;
++constexpr uint8_t REG_MINUTES = 0x03;
++constexpr uint8_t REG_HOURS = 0x04;
++
++uint8_t bcdToDec(uint8_t b) { return ((b >> 4) * 10) + (b & 0x0F); }
++uint8_t decToBcd(uint8_t d) { return ((d / 10) << 4) | (d % 10); }
++}  // namespace
+ 
+ void HalClock::begin() {
+-  if (!gpio.deviceIsX3()) {
++  // Arduino-ESP32 v3.x's TwoWire::begin() is idempotent — if lgfx has already
++  // configured the underlying ESP-IDF I2C driver on port 1, this call binds
++  // Wire1 to it without reinstalling.
++  Wire1.begin(BM8563_SDA_PIN, BM8563_SCL_PIN, BM8563_FREQ);
++
++  Wire1.beginTransmission(BM8563_ADDR);
++  Wire1.write(REG_SECONDS);
++  if (Wire1.endTransmission(false) != 0) {
+     _available = false;
++    LOG_INF("CLK", "BM8563 RTC not detected on I2C1 (addr 0x51)");
+     return;
+   }
+-
+-  // I2C is already initialised by HalPowerManager::begin() for X3.
+-  // Probe the DS3231 by reading the seconds register.
+-  Wire.beginTransmission(I2C_ADDR_DS3231);
+-  Wire.write(DS3231_SEC_REG);
+-  if (Wire.endTransmission(false) != 0) {
+-    LOG_INF("CLK", "DS3231 RTC not found");
++  if (Wire1.requestFrom(BM8563_ADDR, static_cast<uint8_t>(1)) < 1) {
+     _available = false;
+     return;
+   }
+-  Wire.requestFrom(I2C_ADDR_DS3231, (uint8_t)1);
+-  if (Wire.available() < 1) {
+-    _available = false;
+-    return;
+-  }
+-  Wire.read();  // discard — just testing connectivity
++  Wire1.read();  // discard — only probing connectivity
+ 
+   _available = true;
+-  LOG_INF("CLK", "DS3231 RTC found");
++  LOG_INF("CLK", "BM8563 RTC detected");
+ 
+-  // Prime the cache with an initial read
++  // Prime the cache with an initial read so the first status-bar render after
++  // boot has a value, not a 00:00 placeholder.
+   uint8_t h, m;
+   getTime(h, m);
+ }
+@@ -51,49 +63,41 @@
+   if (!_available) return false;
+ 
+   const unsigned long now = millis();
+-  if (_lastPollMs != 0 && (now - _lastPollMs) < CLOCK_POLL_MS) {
++  if (_hasCachedTime && (now - _lastPollMs) < CLOCK_POLL_MS) {
+     hour = _cachedHour;
+     minute = _cachedMinute;
+     return true;
+   }
+ 
+-  // Read 3 bytes starting at register 0x00: seconds, minutes, hours
+-  Wire.beginTransmission(I2C_ADDR_DS3231);
+-  Wire.write(DS3231_SEC_REG);
+-  if (Wire.endTransmission(false) != 0) {
+-    if (!_hasCachedTime) return false;
+-    _lastPollMs = now;
+-    hour = _cachedHour;
+-    minute = _cachedMinute;
+-    return true;
++  Wire1.beginTransmission(BM8563_ADDR);
++  Wire1.write(REG_SECONDS);
++  if (Wire1.endTransmission(false) != 0) {
++    if (_hasCachedTime) {
++      hour = _cachedHour;
++      minute = _cachedMinute;
++      _lastPollMs = now;
++      return true;
++    }
++    return false;
+   }
+-  Wire.requestFrom(I2C_ADDR_DS3231, (uint8_t)3);
+-  if (Wire.available() < 3) {
+-    if (!_hasCachedTime) return false;
+-    _lastPollMs = now;
+-    hour = _cachedHour;
+-    minute = _cachedMinute;
+-    return true;
++  if (Wire1.requestFrom(BM8563_ADDR, static_cast<uint8_t>(3)) < 3) {
++    if (_hasCachedTime) {
++      hour = _cachedHour;
++      minute = _cachedMinute;
++      _lastPollMs = now;
++      return true;
++    }
++    return false;
+   }
+ 
+-  Wire.read();  // seconds — not needed
+-  const uint8_t rawMin = Wire.read();
+-  const uint8_t rawHour = Wire.read();
++  (void)Wire1.read();  // 0x02 seconds — discard
++  const uint8_t rawMin = Wire1.read();
++  const uint8_t rawHour = Wire1.read();
+ 
+   _cachedMinute = bcdToDec(rawMin & 0x7F);
+-  // Handle 12/24h mode: bit 6 high = 12h mode
+-  if (rawHour & 0x40) {
+-    // 12h mode: bit 5 = PM, bits 4-0 = hours (1-12)
+-    uint8_t h12 = bcdToDec(rawHour & 0x1F);
+-    bool pm = rawHour & 0x20;
+-    if (h12 == 12) h12 = 0;
+-    _cachedHour = pm ? (h12 + 12) : h12;
+-  } else {
+-    // 24h mode: bits 5-0 = hours (0-23)
+-    _cachedHour = bcdToDec(rawHour & 0x3F);
+-  }
+-  _lastPollMs = now;
++  _cachedHour = bcdToDec(rawHour & 0x3F);  // mask reserved bits 7-6
+   _hasCachedTime = true;
++  _lastPollMs = now;
+ 
+   hour = _cachedHour;
+   minute = _cachedMinute;
+@@ -101,51 +105,48 @@
+ }
+ 
+ bool HalClock::formatTime(char* buf, size_t bufSize, uint8_t utcOffsetQuarterHoursBiased, bool use12Hour) const {
+-  if (bufSize < (use12Hour ? 9u : 6u)) return false;
++  if (bufSize < 6) return false;
+   uint8_t h, m;
+   if (!getTime(h, m)) return false;
+ 
+-  // Apply UTC offset: convert biased value to signed quarter-hours.
+-  // Clamp against corrupted persisted values so display time can't drift outside [-12:00, +14:00].
+-  if (utcOffsetQuarterHoursBiased > 104) utcOffsetQuarterHoursBiased = 104;
+-  int offsetQuarterHours = static_cast<int>(utcOffsetQuarterHoursBiased) - 48;
++  // Quarter-hour offset, biased so 48 = UTC+0. Range 0..104 covers
++  // UTC-12:00 to UTC+14:00 in 15-minute steps (Nepal, India, Chatham, ...).
++  const int offsetQuarterHours = static_cast<int>(utcOffsetQuarterHoursBiased) - 48;
+   int totalMinutes = static_cast<int>(h) * 60 + static_cast<int>(m) + offsetQuarterHours * 15;
+-
+-  // Wrap around 24 hours
+-  totalMinutes = ((totalMinutes % 1440) + 1440) % 1440;
++  totalMinutes = ((totalMinutes % 1440) + 1440) % 1440;  // wrap 24h
+ 
+   const int hour24 = totalMinutes / 60;
+-  const int min = totalMinutes % 60;
++  const int minute = totalMinutes % 60;
++
+   if (use12Hour) {
++    if (bufSize < 9) return false;
+     const bool pm = hour24 >= 12;
+-    int hour12 = hour24 % 12;
+-    if (hour12 == 0) hour12 = 12;
+-    snprintf(buf, bufSize, "%d:%02d %s", hour12, min, pm ? "PM" : "AM");
++    int h12 = hour24 % 12;
++    if (h12 == 0) h12 = 12;
++    snprintf(buf, bufSize, "%d:%02d %s", h12, minute, pm ? "PM" : "AM");
+   } else {
+-    snprintf(buf, bufSize, "%02d:%02d", hour24, min);
++    snprintf(buf, bufSize, "%02d:%02d", hour24, minute);
+   }
+   return true;
+ }
+ 
+ bool HalClock::writeTimeToRTC(uint8_t hour, uint8_t minute, uint8_t second) {
+-  assert(hour < 24);
+-  assert(minute < 60);
+-  assert(second < 60);
+-  Wire.beginTransmission(I2C_ADDR_DS3231);
+-  Wire.write(DS3231_SEC_REG);    // Start at register 0x00
+-  Wire.write(decToBcd(second));  // 0x00: Seconds
+-  Wire.write(decToBcd(minute));  // 0x01: Minutes
+-  Wire.write(decToBcd(hour));    // 0x02: Hours (24h mode, bit 6 = 0)
+-  if (Wire.endTransmission() != 0) {
+-    LOG_ERR("CLK", "Failed to write time to DS3231");
++  if (!_available) return false;
++
++  Wire1.beginTransmission(BM8563_ADDR);
++  Wire1.write(REG_SECONDS);
++  Wire1.write(decToBcd(second));  // 0x02 — VL bit cleared by writing
++  Wire1.write(decToBcd(minute));  // 0x03
++  Wire1.write(decToBcd(hour));    // 0x04 — 24-hour mode (bit 6 = 0)
++  if (Wire1.endTransmission() != 0) {
++    LOG_ERR("CLK", "Failed to write time to BM8563");
+     return false;
+   }
+ 
+-  // Invalidate cache so next read fetches fresh data
+-  _lastPollMs = 0;
+   _cachedHour = hour;
+   _cachedMinute = minute;
+   _hasCachedTime = true;
++  _lastPollMs = millis();
+   return true;
+ }
+ 
+@@ -160,19 +161,17 @@
+   LOG_INF("CLK", "Starting NTP sync...");
+   configTzTime("UTC0", "pool.ntp.org", "time.nist.gov");
+ 
+-  // Wait for SNTP sync to complete (up to 5 seconds)
+   constexpr int maxAttempts = 50;
+   for (int i = 0; i < maxAttempts; i++) {
+-    if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+-      time_t now = time(nullptr);
++    const time_t now = time(nullptr);
++    if (now > 1700000000) {  // sanity: after ~Nov 2023
+       struct tm timeinfo;
+       gmtime_r(&now, &timeinfo);
+-
+-      if (writeTimeToRTC(timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec)) {
++      const bool ok = writeTimeToRTC(timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
++      if (ok) {
+         LOG_INF("CLK", "RTC set to %02d:%02d:%02d UTC", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+-        return true;
+       }
+-      return false;
++      return ok;
+     }
+     delay(100);
+   }
+diff -ruN hal_a/hal/HalClock.h hal_b/hal/HalClock.h
+--- hal_a/hal/HalClock.h	2026-07-16 23:12:38.010420507 +0000
++++ hal_b/hal/HalClock.h	2026-07-16 23:12:38.014455144 +0000
+@@ -3,11 +3,19 @@
+ #include <Arduino.h>
+ #include <Wire.h>
+ 
+-#include "HalGPIO.h"
+-
+ class HalClock;
+ extern HalClock halClock;  // Singleton
+ 
++// Real-time clock abstraction.
++//
++// On Paper S3 this is backed by the on-board BM8563 RTC, addressed directly
++// over Wire1 (I2C1, the same physical bus as GT911 touch). The BM8563 is
++// less accurate than the DS3231 used on the X3 (~20 ppm vs ~2 ppm) and
++// drifts further during deep sleep, so we expose a best-effort time and rely
++// on NTP resync to correct drift over time.
++//
++// Time is stored in the RTC as UTC. The display-time offset (set by the user)
++// is applied only in formatTime().
+ class HalClock {
+   bool _available = false;
+   mutable uint8_t _cachedHour = 0;
+@@ -18,29 +26,33 @@
+   static constexpr unsigned long CLOCK_POLL_MS = 10000;  // 10 seconds
+ 
+  public:
+-  // Call after gpio.begin() and powerManager.begin() (I2C already initialised for X3)
++  // Call after gpio.begin() (which initialises the touch driver and thereby
++  // the shared I2C1 bus). Probes the BM8563 at 0x51 and marks _available
++  // accordingly.
+   void begin();
+ 
+-  // True if the DS3231 RTC is present on this device
++  // True if the BM8563 RTC responded to the probe at begin() time.
+   bool isAvailable() const { return _available; }
+ 
+-  // Get current hour (0-23) and minute (0-59).
++  // Get current UTC hour (0-23) and minute (0-59) with 10-second caching.
+   // Returns false if RTC is not available.
+   bool getTime(uint8_t& hour, uint8_t& minute) const;
+ 
+   // Format time into a caller-provided buffer.
+-  // 24h mode produces "HH:MM" (needs >=6 bytes); 12h mode produces "H:MM AM"/"HH:MM PM" (needs >=9 bytes).
+-  // utcOffsetQuarterHoursBiased: biased quarter-hour offset (48 = UTC+0, 0 = UTC-12, 104 = UTC+14).
++  // 24h mode produces "HH:MM" (needs >=6 bytes); 12h mode produces
++  // "H:MM AM"/"HH:MM PM" (needs >=9 bytes).
++  // utcOffsetQuarterHoursBiased: biased quarter-hour offset
++  //   (48 = UTC+0, 0 = UTC-12, 104 = UTC+14).
+   // use12Hour: when true, format as 12-hour clock with AM/PM suffix.
+   // Returns false if RTC is not available.
+   bool formatTime(char* buf, size_t bufSize, uint8_t utcOffsetQuarterHoursBiased = 48, bool use12Hour = false) const;
+ 
+-  // Sync the DS3231 RTC from an NTP server. Requires WiFi to be connected.
++  // Sync the RTC from an NTP server. Requires WiFi to be connected.
+   // Blocks for up to ~5s while waiting for SNTP response.
+   // Returns true if the RTC was successfully updated.
+   //
+-  // Debouncing (skip if already synced once) is enforced by the caller, not here,
+-  // so the HAL stays free of any app-layer settings dependency.
++  // Debouncing (skip if already synced once) is enforced by the caller, not
++  // here, so the HAL stays free of any app-layer settings dependency.
+   bool syncFromNTP();
+ 
+  private:
+diff -ruN hal_a/hal/HalDisplay.cpp hal_b/hal/HalDisplay.cpp
+--- hal_a/hal/HalDisplay.cpp	2026-07-16 23:12:38.010433695 +0000
++++ hal_b/hal/HalDisplay.cpp	2026-07-16 23:12:38.018007513 +0000
+@@ -1,130 +1,210 @@
++#include <EPD_Painter.h>
++#include <EPD_Painter_presets.h>
+ #include <HalDisplay.h>
+-#include <HalGPIO.h>
+ 
+-// Global HalDisplay instance
+-HalDisplay display;
++#include <cstring>
+ 
+-#define SD_SPI_MISO 7
++HalDisplay::HalDisplay() : frameBuffer(nullptr) {}
+ 
+-HalDisplay::HalDisplay() : einkDisplay(EPD_SCLK, EPD_MOSI, EPD_CS, EPD_DC, EPD_RST, EPD_BUSY) {}
++HalDisplay::~HalDisplay() {
++  freeGrayscaleBuffers();
++  if (epd) {
++    epd->end();
++    delete epd;
++    epd = nullptr;
++  }
++  if (frameBuffer) {
++    heap_caps_free(frameBuffer);
++    frameBuffer = nullptr;
++  }
++}
+ 
+-HalDisplay::~HalDisplay() {}
++void HalDisplay::freeGrayscaleBuffers() {
++  if (grayLsbBuffer) {
++    heap_caps_free(grayLsbBuffer);
++    grayLsbBuffer = nullptr;
++  }
++  if (grayMsbBuffer) {
++    heap_caps_free(grayMsbBuffer);
++    grayMsbBuffer = nullptr;
++  }
++}
+ 
+-void HalDisplay::begin(bool seamless) {
+-  // Set X3-specific panel mode before initializing.
+-  if (gpio.deviceIsX3()) {
+-    einkDisplay.setDisplayX3();
++void HalDisplay::begin() {
++  // Allocate 8bpp framebuffer in PSRAM — EPD_Painter native format
++  frameBuffer = static_cast<uint8_t*>(heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
++  if (!frameBuffer) {
++    frameBuffer = static_cast<uint8_t*>(malloc(BUFFER_SIZE));
++  }
++  if (frameBuffer) {
++    memset(frameBuffer, 0, BUFFER_SIZE);  // 0 = white in EPD_Painter
+   }
+ 
+-  einkDisplay.begin();
++  EPD_Painter::Config epdConfig = EPD_PAINTER_PRESET;
++  epdConfig.rotation = EPD_Painter::Rotation::ROTATION_0;
++  epdConfig.quality = EPD_Painter::Quality::QUALITY_NORMAL;
++  epdConfig.i2c.scl = -1;
++  epdConfig.i2c.sda = -1;
+ 
+-  if (seamless) {
+-    // Defuse the SDK's X3 _x3InitialFullSyncsRemaining counter (no-op on X4)
+-    // so the first paint isn't promoted to FULL (~770ms). Skips the wakeup-
+-    // gated requestResync() below for the same reason.
+-    einkDisplay.skipInitialResync();
+-    return;
+-  }
+-  // Request resync after specific wakeup events to ensure clean display state.
+-  const auto wakeupReason = gpio.getWakeupReason();
+-  if (wakeupReason == HalGPIO::WakeupReason::PowerButton || wakeupReason == HalGPIO::WakeupReason::AfterFlash ||
+-      wakeupReason == HalGPIO::WakeupReason::Other) {
+-    einkDisplay.requestResync();
++  epd = new EPD_Painter(epdConfig);
++  bool ok = epd->begin();
++
++  // Full white paint on boot to physically clear the sleep cover and sync
++  // EPD_Painter's internal state with the panel. clear() resets the internal
++  // buffer, then paint() drives the e-ink particles to white.
++  if (ok && frameBuffer) {
++    epd->clear();
++    epd->setQuality(EPD_Painter::Quality::QUALITY_HIGH);
++    epd->paint(frameBuffer);  // frameBuffer is all-zero (white) from memset above
+   }
++
++  if (Serial)
++    Serial.printf("[%lu] HalDisplay: begin() - framebuffer %s, EPD_Painter %s\n", millis(), frameBuffer ? "OK" : "FAIL",
++                  ok ? "OK" : "FAIL");
+ }
+ 
+-void HalDisplay::clearScreen(uint8_t color) const { einkDisplay.clearScreen(color); }
++void HalDisplay::clearScreen(uint8_t color) const {
++  if (!frameBuffer) return;
++  // Map old 1-bit convention to 8bpp EPD_Painter values:
++  // 0xFF (old white) → 0 (EPD white), 0x00 (old black) → 3 (EPD black)
++  uint8_t epdColor = (color == 0xFF) ? 0 : 3;
++  memset(frameBuffer, epdColor, BUFFER_SIZE);
++}
+ 
+ void HalDisplay::drawImage(const uint8_t* imageData, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                            bool fromProgmem) const {
+-  einkDisplay.drawImage(imageData, x, y, w, h, fromProgmem);
++  if (!frameBuffer) return;
++
++  // Source images are 1-bit packed (8 pixels/byte, MSB first, bit=1=white, bit=0=black)
++  // Unpack into 8bpp framebuffer: 0=white, 3=black
++  const uint16_t imageWidthBytes = w / 8;
++
++  for (uint16_t row = 0; row < h; row++) {
++    const uint16_t destY = y + row;
++    if (destY >= DISPLAY_HEIGHT) break;
++
++    const uint32_t destRowStart = destY * DISPLAY_WIDTH + x;
++    const uint16_t srcOffset = row * imageWidthBytes;
++
++    for (uint16_t col = 0; col < imageWidthBytes; col++) {
++      if (x + col * 8 >= DISPLAY_WIDTH) break;
++      uint8_t srcByte = fromProgmem ? pgm_read_byte(&imageData[srcOffset + col]) : imageData[srcOffset + col];
++      uint32_t dstIdx = destRowStart + col * 8;
++      for (int bit = 7; bit >= 0; bit--) {
++        if (dstIdx < BUFFER_SIZE) {
++          frameBuffer[dstIdx] = (srcByte & (1 << bit)) ? 0 : 3;  // bit=1→white(0), bit=0→black(3)
++        }
++        dstIdx++;
++      }
++    }
++  }
+ }
+ 
+ void HalDisplay::drawImageTransparent(const uint8_t* imageData, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                                       bool fromProgmem) const {
+-  einkDisplay.drawImageTransparent(imageData, x, y, w, h, fromProgmem);
++  if (!frameBuffer) return;
++
++  // Transparent draw: only set black pixels, leave white pixels unchanged
++  const uint16_t imageWidthBytes = w / 8;
++
++  for (uint16_t row = 0; row < h; row++) {
++    const uint16_t destY = y + row;
++    if (destY >= DISPLAY_HEIGHT) break;
++
++    const uint32_t destRowStart = destY * DISPLAY_WIDTH + x;
++    const uint16_t srcOffset = row * imageWidthBytes;
++
++    for (uint16_t col = 0; col < imageWidthBytes; col++) {
++      if (x + col * 8 >= DISPLAY_WIDTH) break;
++      uint8_t srcByte = fromProgmem ? pgm_read_byte(&imageData[srcOffset + col]) : imageData[srcOffset + col];
++      uint32_t dstIdx = destRowStart + col * 8;
++      for (int bit = 7; bit >= 0; bit--) {
++        if (dstIdx < BUFFER_SIZE && !(srcByte & (1 << bit))) {
++          frameBuffer[dstIdx] = 3;  // source bit=0 → black
++        }
++        dstIdx++;
++      }
++    }
++  }
+ }
+ 
+-EInkDisplay::RefreshMode convertRefreshMode(HalDisplay::RefreshMode mode) {
++void HalDisplay::displayBuffer(RefreshMode mode, bool turnOffScreen) {
++  if (!epd || !frameBuffer) return;
++
+   switch (mode) {
+-    case HalDisplay::FULL_REFRESH:
+-      return EInkDisplay::FULL_REFRESH;
+-    case HalDisplay::HALF_REFRESH:
+-      return EInkDisplay::HALF_REFRESH;
+-    case HalDisplay::FAST_REFRESH:
++    case FULL_REFRESH:
++      // Full clear + repaint — eliminates all ghosting
++      epd->clear();
++      epd->setQuality(EPD_Painter::Quality::QUALITY_HIGH);
++      break;
++    case HALF_REFRESH:
++    case FAST_REFRESH:
+     default:
+-      return EInkDisplay::FAST_REFRESH;
++      // Use QUALITY_HIGH for all modes — QUALITY_NORMAL leaves ghost traces
++      // on e-paper because it doesn't fully drive the ink particles.
++      epd->setQuality(EPD_Painter::Quality::QUALITY_HIGH);
++      break;
+   }
+-}
+ 
+-void HalDisplay::displayBuffer(HalDisplay::RefreshMode mode, bool turnOffScreen) {
+-  if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
+-    einkDisplay.requestResync(1);
+-  }
++  epd->paint(frameBuffer);
++}
+ 
+-  einkDisplay.displayBuffer(convertRefreshMode(mode), turnOffScreen);
++void HalDisplay::refreshDisplay(RefreshMode mode, bool turnOffScreen) {
++  // With EPD_Painter, refresh = repaint the current buffer
++  displayBuffer(mode, turnOffScreen);
+ }
+ 
+-void HalDisplay::refreshDisplay(HalDisplay::RefreshMode mode, bool turnOffScreen) {
+-  if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
+-    einkDisplay.requestResync(1);
++void HalDisplay::deepSleep() {
++  if (epd) {
++    epd->end();
+   }
+-
+-  einkDisplay.refreshDisplay(convertRefreshMode(mode), turnOffScreen);
+ }
+ 
+-void HalDisplay::deepSleep() { einkDisplay.deepSleep(); }
+-
+-uint8_t* HalDisplay::getFrameBuffer() const { return einkDisplay.getFrameBuffer(); }
+-
+-uint8_t* HalDisplay::lendFrameBufferStorage(uint32_t* sizeOut) { return einkDisplay.lendBuildStorage(sizeOut); }
+-
+-void HalDisplay::returnFrameBufferStorage() { einkDisplay.returnBuildStorage(); }
++uint8_t* HalDisplay::getFrameBuffer() const { return frameBuffer; }
+ 
+ void HalDisplay::copyGrayscaleBuffers(const uint8_t* lsbBuffer, const uint8_t* msbBuffer) {
+-  einkDisplay.copyGrayscaleBuffers(lsbBuffer, msbBuffer);
++  // Not used in the current flow — grayscale uses LSB/MSB copy + displayGrayBuffer
+ }
+ 
+-void HalDisplay::displayGrayscaleBase(RefreshMode fallback, bool turnOffScreen) {
+-  // X3: a HALF fallback means the caller wants a clean base (e.g. the sleep
+-  // cover, a full-screen swap from arbitrary prior content). Without this, the
+-  // X3 grayscale base takes its gentle differential happy path and the prior
+-  // home/reader frame ghosts through the soft aa_pre_bw_mid waveform. Forcing a
+-  // resync makes displayGrayscaleBase clear first, matching displayBuffer(HALF).
+-  // The reader's FAST path is deliberately left on the differential path so
+-  // per-page grayscale stays cheap.
+-  if (gpio.deviceIsX3() && fallback == RefreshMode::HALF_REFRESH) {
+-    einkDisplay.requestResync(1);
++void HalDisplay::copyGrayscaleLsbBuffers(const uint8_t* lsbBuffer) {
++  if (!lsbBuffer) return;
++  if (!grayLsbBuffer) {
++    grayLsbBuffer = static_cast<uint8_t*>(heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
++    if (!grayLsbBuffer) grayLsbBuffer = static_cast<uint8_t*>(malloc(BUFFER_SIZE));
+   }
+-
+-  einkDisplay.displayGrayscaleBase(convertRefreshMode(fallback), turnOffScreen);
++  if (grayLsbBuffer) memcpy(grayLsbBuffer, lsbBuffer, BUFFER_SIZE);
+ }
+ 
+-void HalDisplay::preconditionGrayscale() { einkDisplay.preconditionGrayscale(); }
+-
+-void HalDisplay::preconditionGrayscale(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+-  einkDisplay.preconditionGrayscale(x, y, w, h);
++void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* msbBuffer) {
++  if (!msbBuffer) return;
++  if (!grayMsbBuffer) {
++    grayMsbBuffer = static_cast<uint8_t*>(heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
++    if (!grayMsbBuffer) grayMsbBuffer = static_cast<uint8_t*>(malloc(BUFFER_SIZE));
++  }
++  if (grayMsbBuffer) memcpy(grayMsbBuffer, msbBuffer, BUFFER_SIZE);
+ }
+ 
+-void HalDisplay::copyGrayscaleLsbBuffers(const uint8_t* lsbBuffer) { einkDisplay.copyGrayscaleLsbBuffers(lsbBuffer); }
+-
+-void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* msbBuffer) { einkDisplay.copyGrayscaleMsbBuffers(msbBuffer); }
+-
+-void HalDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) { einkDisplay.cleanupGrayscaleBuffers(bwBuffer); }
+-
+-void HalDisplay::displayGrayBuffer(bool turnOffScreen) { einkDisplay.displayGrayBuffer(turnOffScreen); }
+-
+-void HalDisplay::writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* rows, uint16_t yStart, uint16_t numRows) {
+-  einkDisplay.writeGrayscalePlaneStrip(lsbPlane ? EInkDisplay::GRAY_PLANE_LSB : EInkDisplay::GRAY_PLANE_MSB, rows,
+-                                       yStart, numRows);
++void HalDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) {
++  // No cleanup needed — EPD_Painter uses delta updates so we don't need
++  // to push the BW buffer back to "reset" the display state
+ }
+ 
+-bool HalDisplay::supportsStripGrayscale() const { return einkDisplay.supportsStripGrayscale(); }
++void HalDisplay::displayGrayBuffer(bool turnOffScreen) {
++  if (!grayLsbBuffer || !grayMsbBuffer || !epd || !frameBuffer) return;
+ 
+-uint16_t HalDisplay::getDisplayWidth() const { return einkDisplay.getDisplayWidth(); }
+-
+-uint16_t HalDisplay::getDisplayHeight() const { return einkDisplay.getDisplayHeight(); }
+-
+-uint16_t HalDisplay::getDisplayWidthBytes() const { return einkDisplay.getDisplayWidthBytes(); }
++  // Combine two 8bpp gray planes into 4-level grayscale.
++  // Each buffer has values 0 (white/unmarked) or 3 (black/marked).
++  // Map to old bit convention: 0→bit1(white), 3→bit0(black)
++  // then combine: gray = (msb_bit << 1) | lsb_bit → 0=black..3=white
++  // EPD_Painter: 0=white..3=black, so epd_value = 3 - gray
++  for (uint32_t i = 0; i < BUFFER_SIZE; i++) {
++    uint8_t lsb_bit = (grayLsbBuffer[i] == 0) ? 1 : 0;
++    uint8_t msb_bit = (grayMsbBuffer[i] == 0) ? 1 : 0;
++    uint8_t gray = (msb_bit << 1) | lsb_bit;
++    frameBuffer[i] = 3 - gray;
++  }
+ 
+-uint32_t HalDisplay::getBufferSize() const { return einkDisplay.getBufferSize(); }
++  epd->setQuality(EPD_Painter::Quality::QUALITY_NORMAL);
++  epd->paint(frameBuffer);
++  freeGrayscaleBuffers();
++}
+diff -ruN hal_a/hal/HalDisplay.h hal_b/hal/HalDisplay.h
+--- hal_a/hal/HalDisplay.h	2026-07-16 23:12:38.010446956 +0000
++++ hal_b/hal/HalDisplay.h	2026-07-16 23:12:38.019949518 +0000
+@@ -1,10 +1,11 @@
+ #pragma once
+ #include <Arduino.h>
+-#include <EInkDisplay.h>
++
++class EPD_Painter;
+ 
+ class HalDisplay {
+  public:
+-  // Constructor with pin configuration
++  // Constructor
+   HalDisplay();
+ 
+   // Destructor
+@@ -13,23 +14,28 @@
+   // Refresh modes
+   enum RefreshMode {
+     FULL_REFRESH,  // Full refresh with complete waveform
+-    HALF_REFRESH,  // Half refresh (1720ms) - balanced quality and speed
+-    FAST_REFRESH   // Fast refresh using custom LUT
++    HALF_REFRESH,  // Half refresh - balanced quality and speed
++    FAST_REFRESH   // Fast refresh
+   };
+ 
+-  // Pass seamless=true on any path where the panel already shows the
+-  // content it should after begin() returns (silent reboot's popup,
+-  // sleep-wake with a restored buffer). Skips the wakeup-gated
+-  // requestResync() and defuses the SDK's X3 _x3InitialFullSyncsRemaining
+-  // counter; otherwise the first two paints get promoted to FULL
+-  // (~770ms each on X3).
+-  void begin(bool seamless = false);
+-
+-  // Display dimensions
+-  static constexpr uint16_t DISPLAY_WIDTH = EInkDisplay::DISPLAY_WIDTH;
+-  static constexpr uint16_t DISPLAY_HEIGHT = EInkDisplay::DISPLAY_HEIGHT;
++  // Initialize the display hardware and driver
++  void begin();
++
++  // Display dimensions (M5PaperS3: 960x540 physical landscape)
++  static constexpr uint16_t DISPLAY_WIDTH = 960;
++  static constexpr uint16_t DISPLAY_HEIGHT = 540;
++  // 8bpp framebuffer: 1 byte per pixel, values 0(white)..3(black) — EPD_Painter native format
++  static constexpr uint32_t BUFFER_SIZE = DISPLAY_WIDTH * DISPLAY_HEIGHT;
++  // For unpacking 1-bit source images only
+   static constexpr uint16_t DISPLAY_WIDTH_BYTES = DISPLAY_WIDTH / 8;
+-  static constexpr uint32_t BUFFER_SIZE = DISPLAY_WIDTH_BYTES * DISPLAY_HEIGHT;
++
++  // Runtime accessors — match the X3 HalDisplay surface for shared lib code
++  // (JpegToBmpConverter, GfxRenderer). The Paper S3 panel is fixed-size so
++  // these can return constants directly.
++  uint16_t getDisplayWidth() const { return DISPLAY_WIDTH; }
++  uint16_t getDisplayHeight() const { return DISPLAY_HEIGHT; }
++  uint16_t getDisplayWidthBytes() const { return DISPLAY_WIDTH_BYTES; }
++  uint32_t getBufferSize() const { return BUFFER_SIZE; }
+ 
+   // Frame buffer operations
+   void clearScreen(uint8_t color = 0xFF) const;
+@@ -47,27 +53,6 @@
+   // Access to frame buffer
+   uint8_t* getFrameBuffer() const;
+ 
+-  // Lend the framebuffer's ~48 KB STORAGE to a memory-hungry phase (chapter
+-  // builds) without freeing it: the allocation never moves, so repeated loans
+-  // cannot fragment the heap (free+realloc measurably did). No display calls
+-  // between lend and return; the panel keeps its last refreshed image. The
+-  // buffer comes back white — redraw fully. Returns nullptr if already lent.
+-  uint8_t* lendFrameBufferStorage(uint32_t* sizeOut);
+-  void returnFrameBufferStorage();
+-
+-  // X3 grayscale preconditioning (OEM "AA-pre-BW(mid)" settle pass), windowed
+-  // to the gray region in physical panel coordinates (no-arg = full frame).
+-  // Call after the BW base frame is displayed and before the grayscale planes
+-  // are written; no-op on X4. See EInkDisplay::preconditionGrayscale.
+-  void preconditionGrayscale();
+-  void preconditionGrayscale(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
+-
+-  // Display the framebuffer as the base frame for a grayscale overlay that
+-  // follows. On X3, HALF fallback first requests a resync to match
+-  // displayBuffer(HALF); FAST fallback keeps the OEM differential base waveform
+-  // ("AA-pre-BW(mid)"). Other panels display normally with `fallback` mode.
+-  void displayGrayscaleBase(RefreshMode fallback = HALF_REFRESH, bool turnOffScreen = false);
+-
+   void copyGrayscaleBuffers(const uint8_t* lsbBuffer, const uint8_t* msbBuffer);
+   void copyGrayscaleLsbBuffers(const uint8_t* lsbBuffer);
+   void copyGrayscaleMsbBuffers(const uint8_t* msbBuffer);
+@@ -75,20 +60,18 @@
+ 
+   void displayGrayBuffer(bool turnOffScreen = false);
+ 
+-  // Tiled grayscale: stream one band of a plane (lsbPlane selects LSB/MSB RAM)
+-  // straight to the controller; supportsStripGrayscale() gates the path. See
+-  // EInkDisplay::writeGrayscalePlaneStrip.
+-  void writeGrayscalePlaneStrip(bool lsbPlane, const uint8_t* rows, uint16_t yStart, uint16_t numRows);
+-  bool supportsStripGrayscale() const;
+-
+-  // Runtime geometry passthrough
+-  uint16_t getDisplayWidth() const;
+-  uint16_t getDisplayHeight() const;
+-  uint16_t getDisplayWidthBytes() const;
+-  uint32_t getBufferSize() const;
+-
+  private:
+-  EInkDisplay einkDisplay;
++  // 8bpp framebuffer in PSRAM — EPD_Painter native format (0=white, 3=black)
++  uint8_t* frameBuffer;
++
++  // EPD_Painter driver instance
++  EPD_Painter* epd = nullptr;
++
++  // Grayscale buffers (8bpp, allocated on demand for two-pass rendering)
++  uint8_t* grayLsbBuffer = nullptr;
++  uint8_t* grayMsbBuffer = nullptr;
++  void freeGrayscaleBuffers();
+ };
+ 
++// Global singleton — defined in src/main.cpp.
+ extern HalDisplay display;
+diff -ruN hal_a/hal/HalGPIO.cpp hal_b/hal/HalGPIO.cpp
+--- hal_a/hal/HalGPIO.cpp	2026-07-16 23:12:38.010459884 +0000
++++ hal_b/hal/HalGPIO.cpp	2026-07-16 23:12:38.020872588 +0000
+@@ -1,295 +1,276 @@
+ #include <HalGPIO.h>
+ #include <Logging.h>
+-#include <Preferences.h>
+ #include <SPI.h>
+-#include <Wire.h>
+-#include <esp_sleep.h>
+ 
+-// Global HalGPIO instance
+-HalGPIO gpio;
+-
+-namespace X3GPIO {
+-
+-struct X3ProbeResult {
+-  bool bq27220 = false;
+-  bool ds3231 = false;
+-  bool qmi8658 = false;
+-
+-  uint8_t score() const {
+-    return static_cast<uint8_t>(bq27220) + static_cast<uint8_t>(ds3231) + static_cast<uint8_t>(qmi8658);
+-  }
+-};
+-
+-bool readI2CReg8(uint8_t addr, uint8_t reg, uint8_t* outValue) {
+-  Wire.beginTransmission(addr);
+-  Wire.write(reg);
+-  if (Wire.endTransmission(false) != 0) {
+-    return false;
+-  }
+-  if (Wire.requestFrom(addr, static_cast<uint8_t>(1), static_cast<uint8_t>(true)) < 1) {
+-    return false;
+-  }
+-  *outValue = Wire.read();
+-  return true;
+-}
+-
+-bool readI2CReg16LE(uint8_t addr, uint8_t reg, uint16_t* outValue) {
+-  Wire.beginTransmission(addr);
+-  Wire.write(reg);
+-  if (Wire.endTransmission(false) != 0) {
+-    return false;
++// Touch zones in LOGICAL portrait coordinates (540 wide x 960 tall).
++// The physical display is 960x540 landscape; GfxRenderer rotates to portrait.
++// GT911 on M5PaperS3 reports in portrait: x[0-539], y[0-959].
++static constexpr int16_t PORT_W = 540;
++static constexpr int16_t PORT_H = 960;
++
++static void getLogicalDimensions(uint8_t orientation, int16_t* outWidth, int16_t* outHeight) {
++  switch (orientation) {
++    case 1:  // LandscapeClockwise
++    case 3:  // LandscapeCounterClockwise
++      *outWidth = PORT_H;
++      *outHeight = PORT_W;
++      break;
++    case 0:  // Portrait
++    case 2:  // PortraitInverted
++    default:
++      *outWidth = PORT_W;
++      *outHeight = PORT_H;
++      break;
+   }
+-  if (Wire.requestFrom(addr, static_cast<uint8_t>(2), static_cast<uint8_t>(true)) < 2) {
+-    while (Wire.available()) {
+-      Wire.read();
+-    }
+-    return false;
+-  }
+-  const uint8_t lo = Wire.read();
+-  const uint8_t hi = Wire.read();
+-  *outValue = (static_cast<uint16_t>(hi) << 8) | lo;
+-  return true;
+ }
+ 
+-bool readBQ27220CurrentMA(int16_t* outCurrent) {
+-  uint16_t raw = 0;
+-  if (!readI2CReg16LE(I2C_ADDR_BQ27220, BQ27220_CUR_REG, &raw)) {
+-    return false;
++void HalGPIO::transformTouchPoint(int16_t rawX, int16_t rawY, int16_t* outX, int16_t* outY) const {
++  switch (touchOrientation) {
++    case 1:  // LandscapeClockwise
++      *outX = PORT_H - 1 - rawY;
++      *outY = rawX;
++      break;
++    case 2:  // PortraitInverted
++      *outX = PORT_W - 1 - rawX;
++      *outY = PORT_H - 1 - rawY;
++      break;
++    case 3:  // LandscapeCounterClockwise
++      *outX = rawY;
++      *outY = PORT_W - 1 - rawX;
++      break;
++    case 0:  // Portrait
++    default:
++      *outX = rawX;
++      *outY = rawY;
++      break;
+   }
+-  *outCurrent = static_cast<int16_t>(raw);
+-  return true;
+ }
+ 
+-bool probeBQ27220Signature() {
+-  uint16_t soc = 0;
+-  uint16_t voltageMv = 0;
+-  if (!readI2CReg16LE(I2C_ADDR_BQ27220, BQ27220_SOC_REG, &soc)) {
+-    return false;
+-  }
+-  if (soc > 100) {
+-    return false;
+-  }
+-  if (!readI2CReg16LE(I2C_ADDR_BQ27220, BQ27220_VOLT_REG, &voltageMv)) {
+-    return false;
+-  }
+-  return voltageMv >= 2500 && voltageMv <= 5000;
+-}
++// 3-zone vertical split: each zone is 1/3 of screen width (180px)
++static constexpr int16_t ZONE_LEFT_END = PORT_W / 3;         // 180
++static constexpr int16_t ZONE_RIGHT_START = PORT_W * 2 / 3;  // 360
+ 
+-bool probeDS3231Signature() {
+-  uint8_t sec = 0;
+-  if (!readI2CReg8(I2C_ADDR_DS3231, DS3231_SEC_REG, &sec)) {
+-    return false;
++void HalGPIO::begin() {
++  // Initialize SD card SPI bus with PaperS3 pins
++  SPI.begin(PAPERS3_SD_SCK, PAPERS3_SD_MISO, PAPERS3_SD_MOSI, PAPERS3_SD_CS);
++  // Initialize GT911 touch on I2C1 (SDA=41, SCL=42, INT=48)
++  if (!touch.begin(41, 42, 48, 0x14)) {
++    LOG_ERR("GPIO", "GT911 touch init failed");
+   }
+-  const uint8_t tensDigit = (sec >> 4) & 0x07;
+-  const uint8_t onesDigit = sec & 0x0F;
+-
+-  return tensDigit <= 5 && onesDigit <= 9;
+ }
+ 
+-bool probeQMI8658Signature() {
+-  uint8_t whoami = 0;
+-  if (readI2CReg8(I2C_ADDR_QMI8658, QMI8658_WHO_AM_I_REG, &whoami) && whoami == QMI8658_WHO_AM_I_VALUE) {
+-    return true;
+-  }
+-  if (readI2CReg8(I2C_ADDR_QMI8658_ALT, QMI8658_WHO_AM_I_REG, &whoami) && whoami == QMI8658_WHO_AM_I_VALUE) {
+-    return true;
++int16_t HalGPIO::getLastTouchX() const {
++  int16_t logicalX = 0;
++  int16_t logicalY = 0;
++  transformTouchPoint(lastTouchX, lastTouchY, &logicalX, &logicalY);
++  return logicalX;
++}
++
++int16_t HalGPIO::getLastTouchY() const {
++  int16_t logicalX = 0;
++  int16_t logicalY = 0;
++  transformTouchPoint(lastTouchX, lastTouchY, &logicalX, &logicalY);
++  return logicalY;
++}
++
++int HalGPIO::touchZoneToButton(int16_t touchX, int16_t touchY) const {
++  // GT911 on M5PaperS3 reports portrait coordinates directly: x[0-539], y[0-959].
++  int16_t logicalX = 0;
++  int16_t logicalY = 0;
++  transformTouchPoint(touchX, touchY, &logicalX, &logicalY);
++
++  int16_t logicalW = 0;
++  int16_t logicalH = 0;
++  getLogicalDimensions(touchOrientation, &logicalW, &logicalH);
++
++  if (logicalX < 0 || logicalX >= logicalW || logicalY < 0 || logicalY >= logicalH) return -1;
++
++  // Footer nav bar: bottom footerHeight pixels are split into 4 equal tap zones
++  // mapping to Back / Confirm / Up / Down (matches drawButtonHints layout)
++  if (footerHeight > 0) {
++    if (logicalY >= logicalH - footerHeight) {
++      const int16_t quarter = logicalW / 4;
++      if (logicalX < quarter) return BTN_BACK;
++      if (logicalX < quarter * 2) return BTN_CONFIRM;
++      if (logicalX < quarter * 3) return BTN_UP;
++      return BTN_DOWN;
++    }
++    // Content-area tap in footer mode — suppress entirely so only the
++    // footer buttons drive input in non-reader / non-keyboard activities.
++    return -1;
+   }
+-  return false;
+-}
+-
+-X3ProbeResult runX3ProbePass() {
+-  X3ProbeResult result;
+-  Wire.begin(X3_I2C_SDA, X3_I2C_SCL, X3_I2C_FREQ);
+-  Wire.setTimeOut(6);
+ 
+-  result.bq27220 = probeBQ27220Signature();
+-  result.ds3231 = probeDS3231Signature();
+-  result.qmi8658 = probeQMI8658Signature();
+-
+-  Wire.end();
+-  pinMode(20, INPUT);
+-  pinMode(0, INPUT);
+-  return result;
++  // Simple 3-zone vertical split across the content area
++  const int16_t zoneLeftEnd = logicalW / 3;
++  const int16_t zoneRightStart = logicalW * 2 / 3;
++  if (logicalX < zoneLeftEnd) return BTN_LEFT;
++  if (logicalX >= zoneRightStart) return BTN_RIGHT;
++  return BTN_CONFIRM;
+ }
+ 
+-}  // namespace X3GPIO
+-
+-namespace {
+-constexpr char HW_NAMESPACE[] = "cphw";
+-constexpr char NVS_KEY_DEV_OVERRIDE[] = "dev_ovr";  // 0=auto, 1=x4, 2=x3
+-constexpr char NVS_KEY_DEV_CACHED[] = "dev_det";    // 0=unknown, 1=x4, 2=x3
+-
+-enum class NvsDeviceValue : uint8_t { Unknown = 0, X4 = 1, X3 = 2 };
+-
+-NvsDeviceValue readNvsDeviceValue(const char* key, NvsDeviceValue defaultValue) {
+-  Preferences prefs;
+-  if (!prefs.begin(HW_NAMESPACE, true)) {
+-    return defaultValue;
+-  }
+-  const uint8_t raw = prefs.getUChar(key, static_cast<uint8_t>(defaultValue));
+-  prefs.end();
+-  if (raw > static_cast<uint8_t>(NvsDeviceValue::X3)) {
+-    return defaultValue;
+-  }
+-  return static_cast<NvsDeviceValue>(raw);
+-}
++void HalGPIO::update() {
++  previousState = currentState;
++  currentState = 0;
+ 
+-void writeNvsDeviceValue(const char* key, NvsDeviceValue value) {
+-  Preferences prefs;
+-  if (!prefs.begin(HW_NAMESPACE, false)) {
++  // During cooldown (after activity transition), drain touch events but don't act on them
++  if (millis() < cooldownUntil) {
++    touch.update();  // Drain pending touch reports
++    touchActive = false;
++    sawMultiTouch = false;
+     return;
+   }
+-  prefs.putUChar(key, static_cast<uint8_t>(value));
+-  prefs.end();
+-}
+ 
+-HalGPIO::DeviceType nvsToDeviceType(NvsDeviceValue value) {
+-  return value == NvsDeviceValue::X3 ? HalGPIO::DeviceType::X3 : HalGPIO::DeviceType::X4;
+-}
++  bool touching = touch.update();
++  uint8_t numPoints = touch.getNumPoints();
+ 
+-HalGPIO::DeviceType detectDeviceTypeWithFingerprint() {
+-  // Explicit override for recovery/support:
+-  // 0 = auto, 1 = force X4, 2 = force X3
+-  const NvsDeviceValue overrideValue = readNvsDeviceValue(NVS_KEY_DEV_OVERRIDE, NvsDeviceValue::Unknown);
+-  if (overrideValue == NvsDeviceValue::X3 || overrideValue == NvsDeviceValue::X4) {
+-    LOG_INF("HW", "Device override active: %s", overrideValue == NvsDeviceValue::X3 ? "X3" : "X4");
+-    return nvsToDeviceType(overrideValue);
+-  }
++  if (touching) {
++    lastTouchX = touch.getX();
++    lastTouchY = touch.getY();
++
++    // Track multi-touch: if we ever see 2+ fingers during this sequence, remember it
++    if (numPoints >= 2) {
++      sawMultiTouch = true;
++    }
+ 
+-  const NvsDeviceValue cachedValue = readNvsDeviceValue(NVS_KEY_DEV_CACHED, NvsDeviceValue::Unknown);
+-  if (cachedValue == NvsDeviceValue::X3 || cachedValue == NvsDeviceValue::X4) {
+-    LOG_INF("HW", "Using cached device type: %s", cachedValue == NvsDeviceValue::X3 ? "X3" : "X4");
+-    return nvsToDeviceType(cachedValue);
+-  }
++    // Record start position on initial touch-down
++    if (!touchActive) {
++      touchActive = true;
++      touchStartX = lastTouchX;
++      touchStartY = lastTouchY;
++    }
+ 
+-  // No cache yet: run active X3 fingerprint probe and persist result.
+-  const X3GPIO::X3ProbeResult pass1 = X3GPIO::runX3ProbePass();
+-  delay(2);
+-  const X3GPIO::X3ProbeResult pass2 = X3GPIO::runX3ProbePass();
+-
+-  const uint8_t score1 = pass1.score();
+-  const uint8_t score2 = pass2.score();
+-  LOG_INF("HW", "X3 probe scores: pass1=%u(bq=%d rtc=%d imu=%d) pass2=%u(bq=%d rtc=%d imu=%d)", score1, pass1.bq27220,
+-          pass1.ds3231, pass1.qmi8658, score2, pass2.bq27220, pass2.ds3231, pass2.qmi8658);
+-  const bool x3Confirmed = (score1 >= 2) && (score2 >= 2);
+-  const bool x4Confirmed = (score1 == 0) && (score2 == 0);
+-
+-  if (x3Confirmed) {
+-    writeNvsDeviceValue(NVS_KEY_DEV_CACHED, NvsDeviceValue::X3);
+-    return HalGPIO::DeviceType::X3;
+-  }
++    // While finger is down, report the zone button as pressed (for held-time detection).
++    // Use touchStart (not current) position so the zone stays locked to the initial tap
++    // intent and doesn't bounce across zone boundaries when the finger drifts slightly.
++    int btn = touchZoneToButton(touchStartX, touchStartY);
++    if (btn >= 0 && btn < HALGPIO_NUM_BUTTONS) {
++      currentState |= (1 << btn);
++    }
++  } else if (touchActive) {
++    // Finger just lifted — classify the gesture
++    lastHeldTime = millis() - pressStartTime;
++    touchActive = false;
++
++    if (footerHeight > 0) {
++      // Footer active (non-reader): no gestures — all touches are plain taps.
++      // 2-finger and swipe are disabled; the footer buttons provide Back/Prev/Next.
++      int btn = touchZoneToButton(touchStartX, touchStartY);
++      if (btn >= 0 && btn < HALGPIO_NUM_BUTTONS) {
++        currentState |= (1 << btn);
++      }
++      LOG_DBG("TOUCH", "tap at (%d,%d) btn=%d (footer mode)", touchStartX, touchStartY, btn);
++    } else if (sawMultiTouch) {
++      // 2-finger tap → BACK (reader only)
++      currentState |= (1 << BTN_BACK);
++      currentState |= (1 << BTN_TWO_FINGER);
++      LOG_DBG("TOUCH", "2-finger tap -> BACK");
++    } else {
++      // Single finger: check for swipe vs tap (reader only)
++      int16_t startLogicalX = 0;
++      int16_t startLogicalY = 0;
++      int16_t lastLogicalX = 0;
++      int16_t lastLogicalY = 0;
++      transformTouchPoint(touchStartX, touchStartY, &startLogicalX, &startLogicalY);
++      transformTouchPoint(lastTouchX, lastTouchY, &lastLogicalX, &lastLogicalY);
++      int16_t deltaY = lastLogicalY - startLogicalY;
++
++      if (deltaY < -SWIPE_THRESHOLD) {
++        // Swiped up (finger moved upward)
++        currentState |= (1 << BTN_SWIPE_UP);
++        currentState |= (1 << BTN_UP);
++        LOG_DBG("TOUCH", "swipe up dy=%d", deltaY);
++      } else if (deltaY > SWIPE_THRESHOLD) {
++        // Swiped down (finger moved downward)
++        currentState |= (1 << BTN_SWIPE_DOWN);
++        currentState |= (1 << BTN_DOWN);
++        LOG_DBG("TOUCH", "swipe down dy=%d", deltaY);
++      } else {
++        // Tap — map to zone based on touch-down position
++        int btn = touchZoneToButton(touchStartX, touchStartY);
++        if (btn >= 0 && btn < HALGPIO_NUM_BUTTONS) {
++          currentState |= (1 << btn);
++        }
++        LOG_DBG("TOUCH", "tap at (%d,%d) btn=%d", touchStartX, touchStartY, btn);
++      }
++    }
+ 
+-  if (x4Confirmed) {
+-    writeNvsDeviceValue(NVS_KEY_DEV_CACHED, NvsDeviceValue::X4);
+-    return HalGPIO::DeviceType::X4;
++    sawMultiTouch = false;
+   }
+ 
+-  // Conservative fallback for first boot with inconclusive probes.
+-  return HalGPIO::DeviceType::X4;
+-}
+-
+-}  // namespace
+-
+-void HalGPIO::begin() {
+-  inputMgr.begin();
+-  SPI.begin(EPD_SCLK, SPI_MISO, EPD_MOSI, EPD_CS);
+-
+-  _deviceType = detectDeviceTypeWithFingerprint();
+-
+-  if (deviceIsX4()) {
+-    pinMode(BAT_GPIO0, INPUT);
+-    pinMode(UART0_RXD, INPUT);
++  // Track press timing
++  uint16_t newPresses = currentState & ~previousState;
++  if (newPresses) {
++    pressStartTime = millis();
++    for (uint8_t i = 0; i < HALGPIO_NUM_BUTTONS; i++) {
++      if (newPresses & (1 << i)) {
++        lastPressedButton = i;
++        break;
++      }
++    }
+   }
+ }
+ 
+-void HalGPIO::update() {
+-  inputMgr.update();
+-  const bool connected = isUsbConnected();
+-  usbStateChanged = (connected != lastUsbConnected);
+-  lastUsbConnected = connected;
++void HalGPIO::clearState() {
++  previousState = 0;
++  currentState = 0;
++  pressStartTime = 0;
++  lastHeldTime = 0;
++  touchActive = false;
++  sawMultiTouch = false;
++  cooldownUntil = millis() + 200;  // Suppress input for 200ms after activity transition
+ }
+ 
+-bool HalGPIO::wasUsbStateChanged() const { return usbStateChanged; }
+-
+-bool HalGPIO::isPressed(uint8_t buttonIndex) const { return inputMgr.isPressed(buttonIndex); }
+-
+-bool HalGPIO::wasPressed(uint8_t buttonIndex) const { return inputMgr.wasPressed(buttonIndex); }
+-
+-bool HalGPIO::wasAnyPressed() const { return inputMgr.wasAnyPressed(); }
+-
+-bool HalGPIO::wasReleased(uint8_t buttonIndex) const { return inputMgr.wasReleased(buttonIndex); }
++bool HalGPIO::isPressed(uint8_t buttonIndex) const {
++  if (buttonIndex >= HALGPIO_NUM_BUTTONS) return false;
++  return currentState & (1 << buttonIndex);
++}
+ 
+-bool HalGPIO::wasAnyReleased() const { return inputMgr.wasAnyReleased(); }
++bool HalGPIO::wasPressed(uint8_t buttonIndex) const {
++  if (buttonIndex >= HALGPIO_NUM_BUTTONS) return false;
++  // Rising edge: pressed now but not before
++  return (currentState & (1 << buttonIndex)) && !(previousState & (1 << buttonIndex));
++}
+ 
+-unsigned long HalGPIO::getHeldTime() const { return inputMgr.getHeldTime(); }
++bool HalGPIO::wasAnyPressed() const { return (currentState & ~previousState) != 0; }
+ 
+-unsigned long HalGPIO::getPowerButtonHeldTime() const { return inputMgr.getPowerButtonHeldTime(); }
++bool HalGPIO::wasReleased(uint8_t buttonIndex) const {
++  if (buttonIndex >= HALGPIO_NUM_BUTTONS) return false;
++  // Falling edge: not pressed now but was before
++  return !(currentState & (1 << buttonIndex)) && (previousState & (1 << buttonIndex));
++}
+ 
+-bool HalGPIO::verifyPowerButtonWakeup(uint16_t requiredDurationMs, bool shortPressAllowed) {
+-  if (shortPressAllowed) {
+-    // Fast path - no duration check needed
+-    return true;
+-  }
+-  // TODO: Intermittent edge case remains: a single tap followed by another single tap
+-  // can still power on the device. Tighten wake debounce/state handling here.
++bool HalGPIO::wasAnyReleased() const { return (previousState & ~currentState) != 0; }
+ 
+-  // Calibrate: subtract boot time already elapsed, assuming button held since boot.
+-  const unsigned long calibration = millis();
+-  const unsigned long calibratedDuration = (calibration < requiredDurationMs) ? (requiredDurationMs - calibration) : 1;
+-
+-  const auto start = millis();
+-  inputMgr.update();
+-  // inputMgr.isPressed() may take up to ~500ms to return correct state
+-  while (!inputMgr.isPressed(BTN_POWER) && millis() - start < 1000) {
+-    delay(10);
+-    inputMgr.update();
+-  }
+-  if (inputMgr.isPressed(BTN_POWER)) {
+-    do {
+-      delay(10);
+-      inputMgr.update();
+-    } while (inputMgr.isPressed(BTN_POWER) && inputMgr.getPowerButtonHeldTime() < calibratedDuration);
+-    if (inputMgr.getPowerButtonHeldTime() < calibratedDuration) {
+-      return false;
+-    }
+-  } else {
+-    return false;
+-  }
+-  return true;
++unsigned long HalGPIO::getHeldTime() const {
++  if (currentState == 0) return lastHeldTime;
++  return millis() - pressStartTime;
+ }
+ 
+ bool HalGPIO::isUsbConnected() const {
+-  if (deviceIsX3()) {
+-    // X3: infer USB/charging via BQ27220 Current() register (0x0C, signed mA).
+-    // Positive current means charging.
+-    for (uint8_t attempt = 0; attempt < 2; ++attempt) {
+-      int16_t currentMa = 0;
+-      if (X3GPIO::readBQ27220CurrentMA(&currentMa)) {
+-        return currentMa > 0;
+-      }
+-      delay(2);
+-    }
+-    return false;
+-  }
+-  // U0RXD/GPIO20 reads HIGH when USB is connected
+-  return digitalRead(UART0_RXD) == HIGH;
++  // With ARDUINO_USB_CDC_ON_BOOT=1, Serial is USB CDC.
++  // operator bool() returns true when a USB host has connected (DTR asserted).
++  // Serial.begin() must be called before this for reliable results.
++  return Serial;
+ }
+ 
+ HalGPIO::WakeupReason HalGPIO::getWakeupReason() const {
++  const bool usbConnected = isUsbConnected();
+   const auto wakeupCause = esp_sleep_get_wakeup_cause();
+   const auto resetReason = esp_reset_reason();
+ 
+-  const bool usbConnected = isUsbConnected();
+-
+-  if ((wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON && !usbConnected) ||
+-      (wakeupCause == ESP_SLEEP_WAKEUP_GPIO && resetReason == ESP_RST_DEEPSLEEP && usbConnected)) {
++  if (wakeupCause == ESP_SLEEP_WAKEUP_EXT0 || wakeupCause == ESP_SLEEP_WAKEUP_EXT1 ||
++      wakeupCause == ESP_SLEEP_WAKEUP_GPIO) {
+     return WakeupReason::PowerButton;
+   }
+-  if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_UNKNOWN && usbConnected) {
+-    return WakeupReason::AfterFlash;
++  if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON && !usbConnected) {
++    return WakeupReason::PowerButton;
+   }
+-  if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON && usbConnected) {
+-    return WakeupReason::AfterUSBPower;
++  // ESP32-S3: After flash, esptool hard-resets via RTS → ESP_RST_POWERON (not ESP_RST_UNKNOWN like ESP32-C3).
++  // On M5PaperS3, the PMIC handles charging independently, so any cold boot with USB connected
++  // should proceed to boot normally (treat as AfterFlash).
++  if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && usbConnected &&
++      (resetReason == ESP_RST_UNKNOWN || resetReason == ESP_RST_POWERON)) {
++    return WakeupReason::AfterFlash;
+   }
+   return WakeupReason::Other;
+-}
++}
+\ No newline at end of file
+diff -ruN hal_a/hal/HalGPIO.h hal_b/hal/HalGPIO.h
+--- hal_a/hal/HalGPIO.h	2026-07-16 23:12:38.010475144 +0000
++++ hal_b/hal/HalGPIO.h	2026-07-16 23:12:38.020938500 +0000
+@@ -1,100 +1,88 @@
+ #pragma once
+ 
+ #include <Arduino.h>
+-#include <InputManager.h>
++#include <HalTouch.h>
+ 
+-// Display SPI pins (custom pins for XteinkX4, not hardware SPI defaults)
+-#define EPD_SCLK 8   // SPI Clock
+-#define EPD_MOSI 10  // SPI MOSI (Master Out Slave In)
+-#define EPD_CS 21    // Chip Select
+-#define EPD_DC 4     // Data/Command
+-#define EPD_RST 5    // Reset
+-#define EPD_BUSY 6   // Busy
+-
+-#define SPI_MISO 7  // SPI MISO, shared between SD card and display (Master In Slave Out)
+-
+-#define BAT_GPIO0 0  // Battery voltage
+-
+-#define UART0_RXD 20  // Used for USB connection detection
+-
+-// Xteink X3 Hardware
+-#define X3_I2C_SDA 20
+-#define X3_I2C_SCL 0
+-#define X3_I2C_FREQ 400000
+-
+-// TI BQ27220 Fuel gauge I2C
+-#define I2C_ADDR_BQ27220 0x55  // Fuel gauge I2C address
+-#define BQ27220_SOC_REG 0x2C   // StateOfCharge() command code (%)
+-#define BQ27220_CUR_REG 0x0C   // Current() command code (signed mA)
+-#define BQ27220_VOLT_REG 0x08  // Voltage() command code (mV)
+-
+-// Analog DS3231 RTC I2C
+-#define I2C_ADDR_DS3231 0x68  // RTC I2C address
+-#define DS3231_SEC_REG 0x00   // Seconds command code (BCD)
+-
+-// QST QMI8658 IMU I2C
+-#define I2C_ADDR_QMI8658 0x6B        // IMU I2C address
+-#define I2C_ADDR_QMI8658_ALT 0x6A    // IMU I2C fallback address
+-#define QMI8658_WHO_AM_I_REG 0x00    // WHO_AM_I command code
+-#define QMI8658_WHO_AM_I_VALUE 0x05  // WHO_AM_I expected value
++// Number of virtual buttons (touch zones + gestures + power)
++#define HALGPIO_NUM_BUTTONS 10
+ 
+ class HalGPIO {
+-#if CROSSPOINT_EMULATED == 0
+-  InputManager inputMgr;
+-#endif
+-
+-  bool lastUsbConnected = false;
+-  bool usbStateChanged = false;
+-
+- public:
+-  enum class DeviceType : uint8_t { X4, X3 };
+-
+- private:
+-  DeviceType _deviceType = DeviceType::X4;
+-
+  public:
+   HalGPIO() = default;
+ 
+-  // Inline device type helpers for cleaner downstream checks
+-  inline bool deviceIsX3() const { return _deviceType == DeviceType::X3; }
+-  inline bool deviceIsX4() const { return _deviceType == DeviceType::X4; }
+-
+-  // Start button GPIO and setup SPI for screen and SD card
++  // Start touch input via GT911 and setup SD card SPI
+   void begin();
+ 
+-  // Button input methods
++  // Button input methods (touch zones mapped to virtual buttons)
+   void update();
++  void clearState();  // Reset button state (call during activity transitions)
+   bool isPressed(uint8_t buttonIndex) const;
++
++  // Raw touch coordinate access for tap-to-select navigation
++  int16_t getLastTouchX() const;
++  int16_t getLastTouchY() const;
++
++  // Footer nav bar: taps in the bottom footerHeight pixels map to
++  // Back / Confirm / Up / Down instead of the normal 3-zone split.
++  // Set to 0 to disable (e.g. in reader activities).
++  void setFooterHeight(int16_t height) { footerHeight = height; }
++  int16_t getFooterHeight() const { return footerHeight; }
++  void setTouchOrientation(uint8_t orientation) { touchOrientation = orientation; }
+   bool wasPressed(uint8_t buttonIndex) const;
+   bool wasAnyPressed() const;
+   bool wasReleased(uint8_t buttonIndex) const;
+   bool wasAnyReleased() const;
+   unsigned long getHeldTime() const;
+-  unsigned long getPowerButtonHeldTime() const;
+-
+-  // Verify power button was held long enough after wakeup.
+-  // Returns true if verification succeeded, false if device should return to sleep.
+-  // Should only be called when wakeup reason is PowerButton.
+-  bool verifyPowerButtonWakeup(uint16_t requiredDurationMs, bool shortPressAllowed);
+ 
+   // Check if USB is connected
+   bool isUsbConnected() const;
+ 
+-  // Returns true once per edge (plug or unplug) since the last update()
+-  bool wasUsbStateChanged() const;
+-
+   enum class WakeupReason { PowerButton, AfterFlash, AfterUSBPower, Other };
+ 
+   WakeupReason getWakeupReason() const;
+ 
+-  // Button indices
+-  static constexpr uint8_t BTN_BACK = 0;
+-  static constexpr uint8_t BTN_CONFIRM = 1;
+-  static constexpr uint8_t BTN_LEFT = 2;
+-  static constexpr uint8_t BTN_RIGHT = 3;
+-  static constexpr uint8_t BTN_UP = 4;
+-  static constexpr uint8_t BTN_DOWN = 5;
++  // Button indices — touch zones map to these
++  // 3-zone vertical split: LEFT / CENTER / RIGHT
++  static constexpr uint8_t BTN_BACK = 0;     // 2-finger tap (gesture)
++  static constexpr uint8_t BTN_CONFIRM = 1;  // Center zone tap (select / in-book settings)
++  static constexpr uint8_t BTN_LEFT = 2;     // Left zone tap (prev page / back in lists)
++  static constexpr uint8_t BTN_RIGHT = 3;    // Right zone tap (next page / forward in lists)
++  static constexpr uint8_t BTN_UP = 4;       // Swipe up (prev page in lists)
++  static constexpr uint8_t BTN_DOWN = 5;     // Swipe down (next page in lists)
+   static constexpr uint8_t BTN_POWER = 6;
++  static constexpr uint8_t BTN_SWIPE_UP = 7;    // Explicit swipe-up gesture
++  static constexpr uint8_t BTN_SWIPE_DOWN = 8;  // Explicit swipe-down gesture
++  static constexpr uint8_t BTN_TWO_FINGER = 9;  // 2-finger tap (also sets BTN_BACK)
++
++ private:
++  // 3-zone vertical split: converts touch X to LEFT/CENTER/RIGHT
++  int touchZoneToButton(int16_t touchX, int16_t touchY) const;
++
++  HalTouch touch;
++
++  // Button state tracking (per-frame edge detection)
++  uint16_t currentState = 0;   // Bitmask of currently pressed buttons
++  uint16_t previousState = 0;  // Bitmask from last frame
++  unsigned long pressStartTime = 0;
++  unsigned long lastHeldTime = 0;
++  unsigned long cooldownUntil = 0;  // Suppress input until this millis() timestamp
++  uint8_t lastPressedButton = 0xFF;
++  int16_t lastTouchX = -1;
++  int16_t lastTouchY = -1;
++
++  // Gesture tracking: swipe detection + multi-finger
++  bool touchActive = false;                       // A finger is currently down
++  int16_t touchStartX = -1;                       // X at touch-down
++  int16_t touchStartY = -1;                       // Y at touch-down
++  bool sawMultiTouch = false;                     // Saw 2+ fingers during this touch sequence
++  static constexpr int16_t SWIPE_THRESHOLD = 50;  // Min Y movement for swipe (px)
++
++  // Footer nav bar height (portrait pixels from bottom edge)
++  int16_t footerHeight = 0;
++  uint8_t touchOrientation = 0;
++
++  void transformTouchPoint(int16_t rawX, int16_t rawY, int16_t* outX, int16_t* outY) const;
+ };
+ 
++// Global singleton — defined in src/main.cpp.
+ extern HalGPIO gpio;
+diff -ruN hal_a/hal/HalM5Mutex.h hal_b/hal/HalM5Mutex.h
+--- hal_a/hal/HalM5Mutex.h	1970-01-01 00:00:00.000000000 +0000
++++ hal_b/hal/HalM5Mutex.h	2026-07-16 23:12:38.020991574 +0000
+@@ -0,0 +1,18 @@
++#pragma once
++
++#include <freertos/semphr.h>
++
++// Shared mutex to protect all M5Unified subsystem access (Display, Touch, Power, etc.)
++// M5GFX is not thread-safe; concurrent M5.update() and M5.Display calls from
++// different FreeRTOS tasks cause spinlock assertion failures.
++namespace HalM5Mutex {
++
++inline SemaphoreHandle_t& get() {
++  static SemaphoreHandle_t mutex = xSemaphoreCreateMutex();
++  return mutex;
++}
++
++inline void lock() { xSemaphoreTake(get(), portMAX_DELAY); }
++inline void unlock() { xSemaphoreGive(get()); }
++
++}  // namespace HalM5Mutex
+diff -ruN hal_a/hal/HalPowerManager.cpp hal_b/hal/HalPowerManager.cpp
+--- hal_a/hal/HalPowerManager.cpp	2026-07-16 23:12:38.010487135 +0000
++++ hal_b/hal/HalPowerManager.cpp	2026-07-16 23:12:38.021055514 +0000
+@@ -8,24 +8,38 @@
+ 
+ #include "HalGPIO.h"
+ 
++// M5PaperS3 power-off pulse pin (active-high pulse turns off PMIC)
++static constexpr int PWROFF_PULSE_PIN = 44;
++
++// M5PaperS3 battery voltage ADC pin (hardware voltage divider, ~2.04x ratio)
++static constexpr int BAT_ADC_PIN = 3;
++static constexpr int BAT_ADC_SAMPLES = 16;         // Number of ADC samples to average
++static constexpr uint16_t BAT_HYSTERESIS_MV = 30;  // Only update if voltage changed by ≥30mV (~3%)
++static uint16_t lastBattMv = 0;                    // Cached smoothed voltage
++
+ HalPowerManager powerManager;  // Singleton instance
+ 
+ void HalPowerManager::begin() {
+-  if (gpio.deviceIsX3()) {
+-    // X3 uses an I2C fuel gauge for battery monitoring.
+-    // I2C init must come AFTER gpio.begin() so early hardware detection/probes are finished.
+-    Wire.begin(X3_I2C_SDA, X3_I2C_SCL, X3_I2C_FREQ);
+-    Wire.setTimeOut(4);
+-    _batteryUseI2C = true;
+-  } else {
+-    pinMode(BAT_GPIO0, INPUT);
+-  }
+   normalFreq = getCpuFrequencyMhz();
+   modeMutex = xSemaphoreCreateMutex();
+   assert(modeMutex != nullptr);
++
++#if CROSSPOINT_PAPERS3
++  // Battery voltage is read via ADC on GPIO 3 (hardware voltage divider).
++  // analogReadMilliVolts() handles ESP32-S3 ADC calibration internally.
++  pinMode(BAT_ADC_PIN, INPUT);
++  analogSetAttenuation(ADC_11db);
++#endif
+ }
+ 
+ void HalPowerManager::setPowerSaving(bool enabled) {
++#if CROSSPOINT_PAPERS3
++  // PaperS3 has a dedicated PMIC for power management and deep-sleeps via
++  // GPIO44 pulse.  CPU throttling from 240→10 MHz only adds touch latency
++  // (~50 ms) with negligible battery savings.  Keep full speed always.
++  (void)enabled;
++  return;
++#else
+   if (normalFreq <= 0) {
+     return;  // invalid state
+   }
+@@ -58,6 +72,7 @@
+   }
+ 
+   // Otherwise, no change needed
++#endif
+ }
+ 
+ void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
+@@ -67,69 +82,61 @@
+     gpio.update();
+   }
+ 
+-#ifdef ENABLE_SERIAL_LOG
+-  // Tear down HWCDC so the host sees a clean disconnect and the peripheral
+-  // doesn't hold power domains that interfere with USB-powered GPIO wake.
+-  // logSerial is the raw HWCDC reference; Serial is the MySerialImpl proxy
+-  // (which doesn't expose end()).
+-  logSerial.end();
+-#endif
+-
+-  // Pre-sleep routines from the original firmware
+-  // GPIO13 is connected to battery latch MOSFET, we need to make sure it's low during sleep
+-  // Note that this means the MCU will be completely powered off during sleep, including RTC
+-  constexpr gpio_num_t GPIO_SPIWP = GPIO_NUM_13;
+-  gpio_set_direction(GPIO_SPIWP, GPIO_MODE_OUTPUT);
+-  gpio_set_level(GPIO_SPIWP, 0);
+-  esp_sleep_config_gpio_isolate();
+-  gpio_deep_sleep_hold_en();
+-  gpio_hold_en(GPIO_SPIWP);
+-  pinMode(InputManager::POWER_BUTTON_PIN, INPUT_PULLUP);
+-  // Arm the wakeup trigger *after* the button is released
+-  // Note: this is only useful for waking up on USB power. On battery, the MCU will be completely powered off, so the
+-  // power button is hard-wired to briefly provide power to the MCU, waking it up regardless of the wakeup source
+-  // configuration
+-  esp_deep_sleep_enable_gpio_wakeup(1ULL << InputManager::POWER_BUTTON_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+-  // Enter Deep Sleep
++  // Power off via GPIO44 pulse to PMIC
++  // This turns off the device completely; wakeup is via power button through PMIC
++  pinMode(PWROFF_PULSE_PIN, OUTPUT);
++  digitalWrite(PWROFF_PULSE_PIN, HIGH);
++  delay(100);
++  digitalWrite(PWROFF_PULSE_PIN, LOW);
++
++  // If powerOff doesn't halt (e.g., USB connected), fall back to deep sleep
++  // with a 5-second timer wakeup as safety net — without a wakeup source the
++  // device would be stuck in unrecoverable deep sleep.
++  esp_sleep_enable_timer_wakeup(5 * 1000 * 1000);  // 5 seconds in microseconds
+   esp_deep_sleep_start();
+ }
+ 
+ uint16_t HalPowerManager::getBatteryPercentage() const {
+-  if (_batteryUseI2C) {
+-    const unsigned long now = millis();
+-    if (_batteryLastPollMs != 0 && (now - _batteryLastPollMs) < BATTERY_POLL_MS) {
+-      return _batteryCachedPercent;
+-    }
++#if CROSSPOINT_PAPERS3
++  static uint16_t cachedPercentX10 = 0;
+ 
+-    // Read SOC directly from I2C fuel gauge (16-bit LE register).
+-    // On I2C error, keep last known value to avoid UI jitter/slowdowns.
+-    Wire.beginTransmission(I2C_ADDR_BQ27220);
+-    Wire.write(BQ27220_SOC_REG);
+-    if (Wire.endTransmission(false) != 0) {
+-      _batteryLastPollMs = now;
+-      return _batteryCachedPercent;
+-    }
+-    Wire.requestFrom(I2C_ADDR_BQ27220, (uint8_t)2);
+-    if (Wire.available() < 2) {
+-      _batteryLastPollMs = now;
+-      return _batteryCachedPercent;
+-    }
+-    const uint8_t lo = Wire.read();
+-    const uint8_t hi = Wire.read();
+-    const uint16_t soc = (hi << 8) | lo;
+-    _batteryCachedPercent = soc > 100 ? 100 : soc;
+-    _batteryLastPollMs = now;
+-    return _batteryCachedPercent;
+-  }
+-  static const BatteryMonitor battery = BatteryMonitor(BAT_GPIO0);
+-
+-  // smooth the battery %.
+-  if (_batteryCachedPercent == 0) {
+-    _batteryCachedPercent = 10 * battery.readPercentage();
++  if (isLowPower) {
++    return cachedPercentX10 / 10;
++  }
++
++  // Average multiple ADC samples to reduce noise (ESP32-S3 ADC jitters ~20-50mV).
++  uint32_t sum = 0;
++  for (int i = 0; i < BAT_ADC_SAMPLES; i++) {
++    sum += analogReadMilliVolts(BAT_ADC_PIN);
++  }
++  const uint16_t adcMv = (uint16_t)(sum / BAT_ADC_SAMPLES);
++  const uint16_t battMv = (uint16_t)((adcMv * 204) / 100);
++
++  // Hysteresis: only update cached voltage if change exceeds threshold.
++  // Prevents the raw percentage from flickering between adjacent values.
++  if (lastBattMv == 0 || abs((int)battMv - (int)lastBattMv) >= BAT_HYSTERESIS_MV) {
++    lastBattMv = battMv;
++  }
++  LOG_DBG("PWR", "Battery ADC=%umV  VBAT=%umV (cached=%umV)", adcMv, battMv, lastBattMv);
++
++  // Li-Po linear approximation: 4200mV = 100%, 3300mV = 0%
++  uint16_t rawPercent = 0;
++  if (lastBattMv >= 4200) {
++    rawPercent = 100;
++  } else if (lastBattMv > 3300) {
++    rawPercent = (uint16_t)((lastBattMv - 3300) * 100 / 900);
++  }
++
++  // Smooth the battery %.
++  if (cachedPercentX10 == 0) {
++    cachedPercentX10 = rawPercent * 10;
+   } else {
+-    _batteryCachedPercent = (_batteryCachedPercent * 9 + battery.readPercentage() * 10) / 10;
++    cachedPercentX10 = (cachedPercentX10 * 9 + rawPercent * 10) / 10;
+   }
+-  return _batteryCachedPercent / 10;
++  return cachedPercentX10 / 10;
++#else
++  return 100;
++#endif
+ }
+ 
+ HalPowerManager::Lock::Lock() {
+diff -ruN hal_a/hal/HalPowerManager.h hal_b/hal/HalPowerManager.h
+--- hal_a/hal/HalPowerManager.h	2026-07-16 23:12:38.010500576 +0000
++++ hal_b/hal/HalPowerManager.h	2026-07-16 23:12:38.021104185 +0000
+@@ -1,10 +1,7 @@
+ #pragma once
+ 
+ #include <Arduino.h>
+-#include <BatteryMonitor.h>
+-#include <InputManager.h>
+ #include <Logging.h>
+-#include <Wire.h>
+ #include <freertos/semphr.h>
+ 
+ #include <cassert>
+@@ -18,11 +15,6 @@
+   int normalFreq = 0;  // MHz
+   bool isLowPower = false;
+ 
+-  // I2C fuel gauge configuration for X3 battery monitoring
+-  bool _batteryUseI2C = false;                   // True if using I2C fuel gauge (X3), false for ADC (X4)
+-  mutable int _batteryCachedPercent = 0;         // Last read battery percentage (0-100)
+-  mutable unsigned long _batteryLastPollMs = 0;  // Timestamp of last battery read in milliseconds
+-
+   enum LockMode { None, NormalSpeed };
+   LockMode currentLockMode = None;
+   SemaphoreHandle_t modeMutex = nullptr;  // Protect access to currentLockMode
+@@ -30,7 +22,6 @@
+  public:
+   static constexpr int LOW_POWER_FREQ = 10;                    // MHz
+   static constexpr unsigned long IDLE_POWER_SAVING_MS = 3000;  // ms
+-  static constexpr unsigned long BATTERY_POLL_MS = 1500;       // ms
+ 
+   void begin();
+ 
+diff -ruN hal_a/hal/HalStorage.cpp hal_b/hal/HalStorage.cpp
+--- hal_a/hal/HalStorage.cpp	2026-07-16 23:12:38.010511991 +0000
++++ hal_b/hal/HalStorage.cpp	2026-07-16 23:12:38.021151484 +0000
+@@ -1,108 +1,242 @@
++#define HAL_STORAGE_IMPL
+ #include "HalStorage.h"
+ 
+ #include <FS.h>  // need to be included before SdFat.h for compatibility with FS.h's File class
+ #include <Logging.h>
+-#include <SDCardManager.h>
++#include <SdFat.h>
+ 
+ #include <cassert>
+ 
+-#define SDCard SDCardManager::getInstance()
++namespace {
++constexpr uint8_t SD_CS_PIN = PAPERS3_SD_CS;
++#if CROSSPOINT_PAPERS3
++constexpr uint32_t SPI_FREQ = 40000000;  // 40MHz — ESP32-S3 SPI supports higher clocks
++#else
++constexpr uint32_t SPI_FREQ = 25000000;  // 25MHz for X4 SD card
++#endif
++SdFat sd;
++bool sdInitialized = false;
++}  // namespace
+ 
+ HalStorage HalStorage::instance;
+ 
+ HalStorage::HalStorage() {
+-  // Recursive so the same task can re-enter StorageLock without self-deadlock.
+-  // openFileForRead/Write take the lock and then assign to a HalFile&
+-  // out-param; if that out-param already held an Impl, its destructor takes
+-  // the lock again to close the prior FsFile under serialization (see
+-  // HalFile::Impl::~Impl below). Priority inheritance still applies to
+-  // recursive mutexes.
+-  storageMutex = xSemaphoreCreateRecursiveMutex();
++  storageMutex = xSemaphoreCreateMutex();
+   assert(storageMutex != nullptr);
+ }
+ 
+ // begin() and ready() are only called from setup, no need to acquire mutex for them
+ 
+-bool HalStorage::begin() { return SDCard.begin(); }
++bool HalStorage::begin() {
++  if (!sd.begin(SD_CS_PIN, SPI_FREQ)) {
++    if (Serial) Serial.printf("[%lu] [SD] SD card not detected\n", millis());
++    sdInitialized = false;
++  } else {
++    if (Serial) Serial.printf("[%lu] [SD] SD card detected\n", millis());
++    sdInitialized = true;
++  }
++  initialized = sdInitialized;
++  return initialized;
++}
+ 
+-bool HalStorage::ready() const { return SDCard.ready(); }
++bool HalStorage::ready() const { return initialized; }
+ 
+ // For the rest of the methods, we acquire the mutex to ensure thread safety
+ 
+ class HalStorage::StorageLock {
+  public:
+-  StorageLock() { xSemaphoreTakeRecursive(HalStorage::getInstance().storageMutex, portMAX_DELAY); }
+-  ~StorageLock() { xSemaphoreGiveRecursive(HalStorage::getInstance().storageMutex); }
++  StorageLock() { xSemaphoreTake(HalStorage::getInstance().storageMutex, portMAX_DELAY); }
++  ~StorageLock() { xSemaphoreGive(HalStorage::getInstance().storageMutex); }
+ };
+ 
+-#define HAL_STORAGE_WRAPPED_CALL(method, ...) \
+-  HalStorage::StorageLock lock;               \
+-  return SDCard.method(__VA_ARGS__);
+-
+ std::vector<String> HalStorage::listFiles(const char* path, int maxFiles) {
+-  HAL_STORAGE_WRAPPED_CALL(listFiles, path, maxFiles);
++  StorageLock lock;
++  std::vector<String> ret;
++  if (!initialized) return ret;
++
++  auto root = sd.open(path);
++  if (!root || !root.isDirectory()) {
++    if (root) root.close();
++    return ret;
++  }
++
++  int count = 0;
++  char name[128];
++  for (auto f = root.openNextFile(); f && count < maxFiles; f = root.openNextFile()) {
++    if (f.isDirectory()) {
++      f.close();
++      continue;
++    }
++    f.getName(name, sizeof(name));
++    ret.emplace_back(name);
++    f.close();
++    count++;
++  }
++  root.close();
++  return ret;
+ }
+ 
+-String HalStorage::readFile(const char* path) { HAL_STORAGE_WRAPPED_CALL(readFile, path); }
++String HalStorage::readFile(const char* path) {
++  StorageLock lock;
++  if (!initialized) return {""};
++
++  FsFile f = sd.open(path, O_RDONLY);
++  if (!f) return {""};
++
++  String content = "";
++  constexpr size_t maxSize = 50000;
++  size_t readSize = 0;
++  while (f.available() && readSize < maxSize) {
++    content += static_cast<char>(f.read());
++    readSize++;
++  }
++  f.close();
++  return content;
++}
+ 
+ bool HalStorage::readFileToStream(const char* path, Print& out, size_t chunkSize) {
+-  HAL_STORAGE_WRAPPED_CALL(readFileToStream, path, out, chunkSize);
++  StorageLock lock;
++  if (!initialized) return false;
++
++  FsFile f = sd.open(path, O_RDONLY);
++  if (!f) return false;
++
++  constexpr size_t localBufSize = 256;
++  uint8_t buf[localBufSize];
++  const size_t toRead = (chunkSize == 0) ? localBufSize : (chunkSize < localBufSize ? chunkSize : localBufSize);
++
++  while (f.available()) {
++    const int r = f.read(buf, toRead);
++    if (r > 0)
++      out.write(buf, static_cast<size_t>(r));
++    else
++      break;
++  }
++  f.close();
++  return true;
+ }
+ 
+ size_t HalStorage::readFileToBuffer(const char* path, char* buffer, size_t bufferSize, size_t maxBytes) {
+-  HAL_STORAGE_WRAPPED_CALL(readFileToBuffer, path, buffer, bufferSize, maxBytes);
++  StorageLock lock;
++  if (!buffer || bufferSize == 0) return 0;
++  if (!initialized) {
++    buffer[0] = '\0';
++    return 0;
++  }
++
++  FsFile f = sd.open(path, O_RDONLY);
++  if (!f) {
++    buffer[0] = '\0';
++    return 0;
++  }
++
++  const size_t maxToRead = (maxBytes == 0) ? (bufferSize - 1) : min(maxBytes, bufferSize - 1);
++  size_t total = 0;
++
++  while (f.available() && total < maxToRead) {
++    constexpr size_t chunk = 64;
++    const size_t want = maxToRead - total;
++    const size_t readLen = (want < chunk) ? want : chunk;
++    const int r = f.read(buffer + total, readLen);
++    if (r > 0)
++      total += static_cast<size_t>(r);
++    else
++      break;
++  }
++  buffer[total] = '\0';
++  f.close();
++  return total;
+ }
+ 
+ bool HalStorage::writeFile(const char* path, const String& content) {
+-  HAL_STORAGE_WRAPPED_CALL(writeFile, path, content);
+-}
++  StorageLock lock;
++  if (!initialized) return false;
+ 
+-bool HalStorage::ensureDirectoryExists(const char* path) { HAL_STORAGE_WRAPPED_CALL(ensureDirectoryExists, path); }
++  if (sd.exists(path)) sd.remove(path);
++
++  FsFile f = sd.open(path, O_RDWR | O_CREAT | O_TRUNC);
++  if (!f) return false;
++
++  const size_t written = f.print(content);
++  f.close();
++  return written == content.length();
++}
++
++bool HalStorage::ensureDirectoryExists(const char* path) {
++  StorageLock lock;
++  if (!initialized) return false;
++
++  if (sd.exists(path)) {
++    FsFile dir = sd.open(path);
++    if (dir && dir.isDirectory()) {
++      dir.close();
++      return true;
++    }
++    dir.close();
++  }
++  return sd.mkdir(path);
++}
+ 
+ class HalFile::Impl {
+  public:
+   Impl(FsFile&& fsFile) : file(std::move(fsFile)) {}
+-  // SdFat is not thread-safe; FsFile::close() touches SD/SPI and must run
+-  // under StorageLock or it races SdSpiCard::m_spiActive across tasks and
+-  // trips FreeRTOS's xTaskPriorityDisinherit assert. The FsFile member
+-  // destructor (DESTRUCTOR_CLOSES_FILE=1) will close() again after the lock
+-  // releases, but close() on an already-closed FsFile is a no-op. See SdFat
+-  // issue #518 and the HAL note in CLAUDE.md.
+-  ~Impl() {
+-    HalStorage::StorageLock lock;
+-    file.close();
+-  }
+   FsFile file;
+ };
+ 
+ HalFile::HalFile() = default;
++
+ HalFile::HalFile(std::unique_ptr<Impl> impl) : impl(std::move(impl)) {}
++
+ HalFile::~HalFile() = default;
++
+ HalFile::HalFile(HalFile&&) = default;
++
+ HalFile& HalFile::operator=(HalFile&&) = default;
+ 
+ HalFile HalStorage::open(const char* path, const oflag_t oflag) {
+-  StorageLock lock;  // ensure thread safety for the duration of this function
+-  return HalFile(std::make_unique<HalFile::Impl>(SDCard.open(path, oflag)));
++  StorageLock lock;
++  return HalFile(std::make_unique<HalFile::Impl>(sd.open(path, oflag)));
+ }
+ 
+-bool HalStorage::mkdir(const char* path, const bool pFlag) { HAL_STORAGE_WRAPPED_CALL(mkdir, path, pFlag); }
++bool HalStorage::mkdir(const char* path, const bool pFlag) {
++  StorageLock lock;
++  return sd.mkdir(path, pFlag);
++}
+ 
+-bool HalStorage::exists(const char* path) { HAL_STORAGE_WRAPPED_CALL(exists, path); }
++bool HalStorage::exists(const char* path) {
++  StorageLock lock;
++  return sd.exists(path);
++}
++
++bool HalStorage::remove(const char* path) {
++  StorageLock lock;
++  return sd.remove(path);
++}
+ 
+-bool HalStorage::remove(const char* path) { HAL_STORAGE_WRAPPED_CALL(remove, path); }
+ bool HalStorage::rename(const char* oldPath, const char* newPath) {
+-  HAL_STORAGE_WRAPPED_CALL(rename, oldPath, newPath);
++  StorageLock lock;
++  return sd.rename(oldPath, newPath);
+ }
+ 
+-bool HalStorage::rmdir(const char* path) { HAL_STORAGE_WRAPPED_CALL(rmdir, path); }
++bool HalStorage::rmdir(const char* path) {
++  StorageLock lock;
++  return sd.rmdir(path);
++}
+ 
+ bool HalStorage::openFileForRead(const char* moduleName, const char* path, HalFile& file) {
+-  StorageLock lock;  // ensure thread safety for the duration of this function
+-  FsFile fsFile;
+-  bool ok = SDCard.openFileForRead(moduleName, path, fsFile);
++  StorageLock lock;
++  if (!sd.exists(path)) {
++    if (Serial) Serial.printf("[%lu] [%s] File does not exist: %s\n", millis(), moduleName, path);
++    return false;
++  }
++  FsFile fsFile = sd.open(path, O_RDONLY);
++  if (!fsFile) {
++    if (Serial) Serial.printf("[%lu] [%s] Failed to open file for reading: %s\n", millis(), moduleName, path);
++    file = HalFile(std::make_unique<HalFile::Impl>(std::move(fsFile)));
++    return false;
++  }
+   file = HalFile(std::make_unique<HalFile::Impl>(std::move(fsFile)));
+-  return ok;
++  return true;
+ }
+ 
+ bool HalStorage::openFileForRead(const char* moduleName, const std::string& path, HalFile& file) {
+@@ -114,11 +248,15 @@
+ }
+ 
+ bool HalStorage::openFileForWrite(const char* moduleName, const char* path, HalFile& file) {
+-  StorageLock lock;  // ensure thread safety for the duration of this function
+-  FsFile fsFile;
+-  bool ok = SDCard.openFileForWrite(moduleName, path, fsFile);
++  StorageLock lock;
++  FsFile fsFile = sd.open(path, O_RDWR | O_CREAT | O_TRUNC);
++  if (!fsFile) {
++    if (Serial) Serial.printf("[%lu] [%s] Failed to open file for writing: %s\n", millis(), moduleName, path);
++    file = HalFile(std::make_unique<HalFile::Impl>(std::move(fsFile)));
++    return false;
++  }
+   file = HalFile(std::make_unique<HalFile::Impl>(std::move(fsFile)));
+-  return ok;
++  return true;
+ }
+ 
+ bool HalStorage::openFileForWrite(const char* moduleName, const std::string& path, HalFile& file) {
+@@ -129,7 +267,33 @@
+   return openFileForWrite(moduleName, path.c_str(), file);
+ }
+ 
+-bool HalStorage::removeDir(const char* path) { HAL_STORAGE_WRAPPED_CALL(removeDir, path); }
++// Internal recursive helper - must be called with StorageLock already held
++static bool removeDirRecursive(SdFat& sd, const char* path) {
++  auto dir = sd.open(path);
++  if (!dir || !dir.isDirectory()) return false;
++
++  auto file = dir.openNextFile();
++  char name[128];
++  while (file) {
++    String filePath = path;
++    if (!filePath.endsWith("/")) filePath += "/";
++    file.getName(name, sizeof(name));
++    filePath += name;
++
++    if (file.isDirectory()) {
++      if (!removeDirRecursive(sd, filePath.c_str())) return false;
++    } else {
++      if (!sd.remove(filePath.c_str())) return false;
++    }
++    file = dir.openNextFile();
++  }
++  return sd.rmdir(path);
++}
++
++bool HalStorage::removeDir(const char* path) {
++  StorageLock lock;
++  return removeDirRecursive(sd, path);
++}
+ 
+ // HalFile implementation
+ // Allow doing file operations while ensuring thread safety via HalStorage's mutex.
+@@ -146,11 +310,9 @@
+ 
+ void HalFile::flush() { HAL_FILE_WRAPPED_CALL(flush, ); }
+ size_t HalFile::getName(char* name, size_t len) { HAL_FILE_WRAPPED_CALL(getName, name, len); }
+-size_t HalFile::size() { HAL_FILE_FORWARD_CALL(size, ); }              // already thread-safe, no need to wrap
+-size_t HalFile::fileSize() { HAL_FILE_FORWARD_CALL(fileSize, ); }      // already thread-safe, no need to wrap
+-uint64_t HalFile::fileSize64() { HAL_FILE_FORWARD_CALL(fileSize, ); }  // already thread-safe, no need to wrap
++size_t HalFile::size() { HAL_FILE_FORWARD_CALL(size, ); }          // already thread-safe, no need to wrap
++size_t HalFile::fileSize() { HAL_FILE_FORWARD_CALL(fileSize, ); }  // already thread-safe, no need to wrap
+ bool HalFile::seek(size_t pos) { HAL_FILE_WRAPPED_CALL(seekSet, pos); }
+-bool HalFile::seek64(uint64_t pos) { HAL_FILE_WRAPPED_CALL(seekSet, pos); }
+ bool HalFile::seekCur(int64_t offset) { HAL_FILE_WRAPPED_CALL(seekCur, offset); }
+ bool HalFile::seekSet(size_t offset) { HAL_FILE_WRAPPED_CALL(seekSet, offset); }
+ int HalFile::available() const { HAL_FILE_WRAPPED_CALL(available, ); }
+diff -ruN hal_a/hal/HalStorage.h hal_b/hal/HalStorage.h
+--- hal_a/hal/HalStorage.h	2026-07-16 23:12:38.010524686 +0000
++++ hal_b/hal/HalStorage.h	2026-07-16 23:12:38.021193631 +0000
+@@ -76,9 +76,7 @@
+   size_t getName(char* name, size_t len);
+   size_t size();
+   size_t fileSize();
+-  uint64_t fileSize64();
+   bool seek(size_t pos);
+-  bool seek64(uint64_t pos);
+   bool seekCur(int64_t offset);
+   bool seekSet(size_t offset);
+   int available() const;
+@@ -96,6 +94,13 @@
+   operator bool() const;
+ };
+ 
++// Only do renaming FsFile to HalFile if this header is included by downstream code
++// The renaming is to allow using the thread-safe HalFile instead of the raw FsFile, without needing to change the
++// downstream code
++#ifndef HAL_STORAGE_IMPL
++using FsFile = HalFile;
++#endif
++
+ // Downstream code must use Storage instead of SdMan
+ #ifdef SdMan
+ #undef SdMan
+diff -ruN hal_a/hal/HalSystem.cpp hal_b/hal/HalSystem.cpp
+--- hal_a/hal/HalSystem.cpp	2026-07-16 23:12:38.010536712 +0000
++++ hal_b/hal/HalSystem.cpp	2026-07-16 23:12:38.021231154 +0000
+@@ -6,67 +6,31 @@
+ #include "HalStorage.h"
+ #include "Logging.h"
+ #include "esp_debug_helpers.h"
+-#include "esp_private/esp_cpu_internal.h"
+-#include "esp_private/esp_system_attr.h"
+-#include "esp_private/panic_internal.h"
+ 
+ #define MAX_PANIC_STACK_DEPTH 32
+ 
+ RTC_NOINIT_ATTR char panicMessage[256];
+ RTC_NOINIT_ATTR HalSystem::StackFrame panicStack[MAX_PANIC_STACK_DEPTH];
+ 
+-extern "C" {
+-
+-void __real_panic_abort(const char* message);
+-void __real_panic_print_backtrace(const void* frame, int core);
++// ESP32-S3 (Xtensa) panic handling
++// Unlike RISC-V, Xtensa uses windowed registers and a different backtrace mechanism.
++// We capture the panic message in RTC memory for post-reboot crash reporting.
++// The backtrace is captured using esp_backtrace_get_start and walking the stack frames.
+ 
++namespace {
+ static DRAM_ATTR const char PANIC_REASON_UNKNOWN[] = "(unknown panic reason)";
+-void IRAM_ATTR __wrap_panic_abort(const char* message) {
++
++// Simple panic message capture - called from the custom abort handler if available,
++// or populated from reset reason after reboot
++void IRAM_ATTR capturePanicMessage(const char* message) {
+   if (!message) message = PANIC_REASON_UNKNOWN;
+-  // IRAM-safe bounded copy (strncpy is not IRAM-safe in panic context)
+   int i = 0;
+   for (; i < (int)sizeof(panicMessage) - 1 && message[i]; i++) {
+     panicMessage[i] = message[i];
+   }
+   panicMessage[i] = '\0';
+-
+-  __real_panic_abort(message);
+-}
+-
+-void IRAM_ATTR __wrap_panic_print_backtrace(const void* frame, int core) {
+-  if (!frame) {
+-    __real_panic_print_backtrace(frame, core);
+-    return;
+-  }
+-  for (size_t i = 0; i < MAX_PANIC_STACK_DEPTH; i++) {
+-    panicStack[i].sp = 0;
+-  }
+-
+-  // Copied from components/esp_system/port/arch/riscv/panic_arch.c
+-  uint32_t sp = (uint32_t)((RvExcFrame*)frame)->sp;
+-  const int per_line = 8;
+-  int depth = 0;
+-  for (int x = 0; x < 1024; x += per_line * sizeof(uint32_t)) {
+-    uint32_t* spp = (uint32_t*)(sp + x);
+-    // panic_print_hex(sp + x);
+-    // panic_print_str(": ");
+-    panicStack[depth].sp = sp + x;
+-    for (int y = 0; y < per_line; y++) {
+-      // panic_print_str("0x");
+-      // panic_print_hex(spp[y]);
+-      // panic_print_str(y == per_line - 1 ? "\r\n" : " ");
+-      panicStack[depth].spp[y] = spp[y];
+-    }
+-
+-    depth++;
+-    if (depth >= MAX_PANIC_STACK_DEPTH) {
+-      break;
+-    }
+-  }
+-
+-  __real_panic_print_backtrace(frame, core);
+-}
+ }
++}  // namespace
+ 
+ namespace HalSystem {
+ 
+@@ -142,7 +106,11 @@
+ 
+ bool isRebootFromPanic() {
+   const auto resetReason = esp_reset_reason();
+-  return resetReason == ESP_RST_PANIC || resetReason == ESP_RST_CPU_LOCKUP;
++  return resetReason == ESP_RST_PANIC
++#ifdef ESP_RST_CPU_LOCKUP
++         || resetReason == ESP_RST_CPU_LOCKUP
++#endif
++      ;
+ }
+ 
+ }  // namespace HalSystem
+diff -ruN hal_a/hal/HalTiltSensor.cpp hal_b/hal/HalTiltSensor.cpp
+--- hal_a/hal/HalTiltSensor.cpp	2026-07-16 23:12:38.010560756 +0000
++++ hal_b/hal/HalTiltSensor.cpp	1970-01-01 00:00:00.000000000 +0000
+@@ -1,234 +0,0 @@
+-#include "HalTiltSensor.h"
+-
+-#include <Logging.h>
+-
+-HalTiltSensor halTiltSensor;  // Singleton instance
+-
+-bool HalTiltSensor::writeReg(uint8_t reg, uint8_t val) const {
+-  Wire.beginTransmission(_i2cAddr);
+-  Wire.write(reg);
+-  Wire.write(val);
+-  return Wire.endTransmission() == 0;
+-}
+-
+-bool HalTiltSensor::readReg(uint8_t reg, uint8_t* val) const {
+-  Wire.beginTransmission(_i2cAddr);
+-  Wire.write(reg);
+-  if (Wire.endTransmission(false) != 0) {
+-    return false;
+-  }
+-  Wire.requestFrom(_i2cAddr, (uint8_t)1);
+-  if (Wire.available() < 1) {
+-    return false;
+-  }
+-  *val = Wire.read();
+-  return true;
+-}
+-
+-bool HalTiltSensor::readGyro(float& gx, float& gy, float& gz) const {
+-  Wire.beginTransmission(_i2cAddr);
+-  Wire.write(REG_GX_L);  // Start reading at Gyro X Low
+-  if (Wire.endTransmission(false) != 0) {
+-    return false;
+-  }
+-
+-  Wire.requestFrom(_i2cAddr, (uint8_t)6);
+-  if (Wire.available() < 6) {
+-    return false;
+-  }
+-
+-  auto readInt16 = [&]() -> int16_t {
+-    const uint8_t lo = Wire.read();
+-    const uint8_t hi = Wire.read();
+-    return static_cast<int16_t>((hi << 8) | lo);
+-  };
+-
+-  // If Full Scale is ±512 dps, the scale factor is 32768 / 512 = 64 LSB/dps
+-  constexpr float SCALE = 1.0f / 64.0f;
+-  gx = readInt16() * SCALE;
+-  gy = readInt16() * SCALE;
+-  gz = readInt16() * SCALE;
+-  return true;
+-}
+-
+-void HalTiltSensor::begin() {
+-  if (!gpio.deviceIsX3()) {
+-    _available = false;
+-    return;
+-  }
+-
+-  // Try primary address, then alternate
+-  uint8_t whoami = 0;
+-  _i2cAddr = I2C_ADDR_QMI8658;
+-  if (!readReg(QMI8658_WHO_AM_I_REG, &whoami) || whoami != QMI8658_WHO_AM_I_VALUE) {
+-    _i2cAddr = I2C_ADDR_QMI8658_ALT;
+-    if (!readReg(QMI8658_WHO_AM_I_REG, &whoami) || whoami != QMI8658_WHO_AM_I_VALUE) {
+-      LOG_ERR("GYR", "QMI8658 IMU not found");
+-      _available = false;
+-      return;
+-    }
+-  }
+-
+-  LOG_INF("GYR", "QMI8658 IMU found at 0x%02X", _i2cAddr);
+-
+-  if (!writeReg(REG_CTRL7, CTRL7_DISABLE_ALL) || !writeReg(REG_CTRL3, CTRL3_FS_512DPS | CTRL3_ODR_28HZ) ||
+-      !writeReg(REG_CTRL1, CTRL1_BASE | CTRL1_SENSOR_DISABLE)) {
+-    LOG_ERR("GYR", "QMI8658 register configuration failed");
+-    _available = false;
+-    return;
+-  }
+-
+-  _available = true;
+-  _initMs = millis();
+-  _lastPollMs = millis();
+-  LOG_INF("GYR", "QMI8658 gyro initialized and put to sleep");
+-}
+-
+-bool HalTiltSensor::wake() {
+-  if (!_available) {
+-    return false;
+-  }
+-
+-  // Wait for init to complete before waking
+-  if ((millis() - _initMs) < SLEEP_STABILIZE_MS) {
+-    return false;
+-  }
+-
+-  if (writeReg(REG_CTRL1, CTRL1_BASE) && writeReg(REG_CTRL7, CTRL7_GYRO_ENABLE)) {
+-    _lastPollMs = millis();
+-    _lastTiltMs = millis();
+-    _wakeMs = millis();
+-    LOG_INF("GYR", "QMI8658 woke up");
+-    return true;
+-  } else {
+-    LOG_ERR("GYR", "Failed to wake QMI8658");
+-    return false;
+-  }
+-}
+-
+-bool HalTiltSensor::deepSleep() {
+-  if (!_available) {
+-    return false;
+-  }
+-
+-  if ((millis() - _wakeMs) < SLEEP_STABILIZE_MS) {
+-    return false;
+-  }
+-
+-  if (writeReg(REG_CTRL7, CTRL7_DISABLE_ALL) && writeReg(REG_CTRL1, CTRL1_BASE | CTRL1_SENSOR_DISABLE)) {
+-    // Clear any residual state so it doesn't immediately trigger upon waking
+-    clearPendingEvents();
+-    _inTilt = false;
+-    LOG_INF("GYR", "QMI8658 entered sleep mode");
+-    return true;
+-  } else {
+-    LOG_ERR("GYR", "Failed to put QMI8658 to sleep");
+-    return false;
+-  }
+-}
+-
+-void HalTiltSensor::update(const uint8_t mode, const uint8_t orientation, const bool inReader) {
+-  if (!_available) {
+-    return;
+-  }
+-
+-  // State machine: wake up or sleep based on the enabled flag
+-  if ((mode != CrossPointTiltPageTurn::TILT_OFF) && !_isAwake) {
+-    _isAwake = wake();
+-    return;
+-  } else if ((mode == CrossPointTiltPageTurn::TILT_OFF) && _isAwake) {
+-    _isAwake = !deepSleep();
+-    return;
+-  }
+-
+-  // If disabled, skip the rest of the polling logic and avoid unnecessary I2C traffic in non-reader activities
+-  if ((mode == CrossPointTiltPageTurn::TILT_OFF) || !inReader) {
+-    return;
+-  }
+-
+-  const unsigned long now = millis();
+-  // Stabilization: discard readings during gyro startup transient
+-  if ((now - _wakeMs) < WAKE_STABILIZE_MS) {
+-    return;
+-  }
+-
+-  if ((now - _lastPollMs) < POLL_INTERVAL_MS) {
+-    return;
+-  }
+-  _lastPollMs = now;
+-
+-  float gx, gy, gz;
+-  if (!readGyro(gx, gy, gz)) {
+-    return;
+-  }
+-
+-  // Map the gyro axis to left/right tilt based on reader orientation.
+-  // On the X3 PCB: X axis = left/right in portrait, Y axis = left/right in landscape.
+-  float tiltAxis;
+-  switch (orientation) {
+-    case CrossPointOrientation::PORTRAIT:
+-      tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? -gx : gx;
+-      break;
+-    case CrossPointOrientation::INVERTED:
+-      tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? gx : -gx;
+-      break;
+-    case CrossPointOrientation::LANDSCAPE_CW:
+-      tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? gy : -gy;
+-      break;
+-    case CrossPointOrientation::LANDSCAPE_CCW:
+-      tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? -gy : gy;
+-      break;
+-    default:
+-      tiltAxis = gx;
+-      break;
+-  }
+-
+-  if (_inTilt) {
+-    // Wait for device to return to neutral before allowing next trigger
+-    if (fabsf(tiltAxis) < NEUTRAL_RATE_DPS) {
+-      _inTilt = false;
+-    }
+-  } else {
+-    // Check for new tilt gesture (with cooldown)
+-    if ((now - _lastTiltMs) >= COOLDOWN_MS) {
+-      if (tiltAxis > RATE_THRESHOLD_DPS) {
+-        _tiltForwardEvent = true;
+-        _hadActivity = true;
+-        _inTilt = true;
+-        _lastTiltMs = now;
+-        LOG_INF("GYR", "Forward Trigger=(%.1f) dps", tiltAxis);
+-      } else if (tiltAxis < -RATE_THRESHOLD_DPS) {
+-        _tiltBackEvent = true;
+-        _hadActivity = true;
+-        _inTilt = true;
+-        _lastTiltMs = now;
+-        LOG_INF("GYR", "Backward Trigger=(%.1f) dps", tiltAxis);
+-      }
+-    }
+-  }
+-}
+-
+-bool HalTiltSensor::wasTiltedForward() {
+-  const bool val = _tiltForwardEvent;
+-  _tiltForwardEvent = false;
+-  return val;
+-}
+-
+-bool HalTiltSensor::wasTiltedBack() {
+-  const bool val = _tiltBackEvent;
+-  _tiltBackEvent = false;
+-  return val;
+-}
+-
+-bool HalTiltSensor::hadActivity() {
+-  const bool val = _hadActivity;
+-  _hadActivity = false;
+-  return val;
+-}
+-
+-void HalTiltSensor::clearPendingEvents() {
+-  _tiltForwardEvent = false;
+-  _tiltBackEvent = false;
+-  _hadActivity = false;
+-  // Intentionally preserve _inTilt so a held tilt doesn't retrigger on next poll
+-}
+diff -ruN hal_a/hal/HalTiltSensor.h hal_b/hal/HalTiltSensor.h
+--- hal_a/hal/HalTiltSensor.h	2026-07-16 23:12:38.010574103 +0000
++++ hal_b/hal/HalTiltSensor.h	1970-01-01 00:00:00.000000000 +0000
+@@ -1,100 +0,0 @@
+-#pragma once
+-
+-#include <Arduino.h>
+-#include <Wire.h>
+-
+-#include "HalGPIO.h"
+-
+-// TODO: Move enums into new header and share with CrossPointSettings.h
+-namespace CrossPointOrientation {
+-enum Value : uint8_t { PORTRAIT = 0, LANDSCAPE_CW = 1, INVERTED = 2, LANDSCAPE_CCW = 3 };
+-}
+-
+-namespace CrossPointTiltPageTurn {
+-enum Value : uint8_t { TILT_OFF = 0, TILT_NORMAL = 1, TILT_INVERTED = 2 };
+-}
+-
+-class HalTiltSensor;
+-extern HalTiltSensor halTiltSensor;  // Singleton
+-
+-class HalTiltSensor {
+-  bool _available = false;
+-  uint8_t _i2cAddr = 0;
+-
+-  // Tilt gesture state machine
+-  bool _tiltForwardEvent = false;  // Consumed by wasTiltedForward()
+-  bool _tiltBackEvent = false;     // Consumed by wasTiltedBack()
+-  bool _hadActivity = false;       // Non-consuming flag for sleep timer
+-  bool _inTilt = false;            // Currently tilted past threshold
+-  bool _isAwake = false;           // Tracks power state
+-  unsigned long _initMs = 0;       // Timestamp of sensor init
+-  unsigned long _lastTiltMs = 0;   // Debounce / cooldown
+-  unsigned long _wakeMs = 0;       // Timestamp of last wake() for stabilization
+-
+-  // Tuning constants
+-  static constexpr float RATE_THRESHOLD_DPS = 270.0f;      // Deg/sec speed to trigger flick
+-  static constexpr float NEUTRAL_RATE_DPS = 50.0f;         // Must stop moving below this rate before next trigger
+-  static constexpr unsigned long COOLDOWN_MS = 600;        // Minimum ms between triggers
+-  static constexpr unsigned long POLL_INTERVAL_MS = 50;    // 20 Hz polling
+-  static constexpr unsigned long WAKE_STABILIZE_MS = 300;  // Ignore readings after wake
+-  static constexpr unsigned long SLEEP_STABILIZE_MS = 15;  // Sleep turn on/off delay
+-
+-  mutable unsigned long _lastPollMs = 0;
+-
+-  // --- QMI8658 registers ---
+-  static constexpr uint8_t REG_CTRL1 = 0x02;
+-  static constexpr uint8_t REG_CTRL3 = 0x04;
+-  static constexpr uint8_t REG_CTRL7 = 0x08;
+-  static constexpr uint8_t REG_GX_L = 0x3B;
+-
+-  // --- Register Bit Flags ---
+-
+-  // REG_CTRL1 (0x02)
+-  static constexpr uint8_t CTRL1_BIG_ENDIAN = (1 << 5);                     // 0x20: Default state (1 = Big Endian)
+-  static constexpr uint8_t CTRL1_AUTO_INC = (1 << 6);                       // 0x40: Enable address auto-increment
+-  static constexpr uint8_t CTRL1_SENSOR_DISABLE = (1 << 0);                 // 0x01: Power down sensor engine
+-  static constexpr uint8_t CTRL1_BASE = CTRL1_AUTO_INC | CTRL1_BIG_ENDIAN;  // 0x60
+-
+-  // REG_CTRL3 (0x04) - Gyro Config
+-  static constexpr uint8_t CTRL3_FS_512DPS = (0b101 << 4);  // Bits 6:4 = 101
+-  static constexpr uint8_t CTRL3_ODR_28HZ = 0b1000;         // Bits 3:0 = 1000 (28.025 Hz)
+-
+-  // REG_CTRL7 (0x08) - Enable
+-  static constexpr uint8_t CTRL7_DISABLE_ALL = 0x00;
+-  static constexpr uint8_t CTRL7_GYRO_ENABLE = (1 << 1);  // Bit 1 = 1
+-
+-  bool writeReg(uint8_t reg, uint8_t val) const;
+-  bool readReg(uint8_t reg, uint8_t* val) const;
+-  bool readGyro(float& gx, float& gy, float& gz) const;
+-
+- public:
+-  // Call after gpio.begin() and powerManager.begin() (I2C already initialised for X3)
+-  void begin();
+-
+-  // Enables the QMI8658 internal sensor engine
+-  bool wake();
+-
+-  // Puts the QMI8658 into a low-power standby state
+-  bool deepSleep();
+-
+-  // True if the QMI8658 IMU is present on this device
+-  bool isAvailable() const { return _available; }
+-
+-  // Poll the accelerometer and update tilt gesture state.
+-  void update(const uint8_t mode, const uint8_t orientation, const bool inReader);
+-
+-  // Returns true once per tilt-forward gesture (next page direction).
+-  // Consumed on read — subsequent calls return false until next gesture.
+-  bool wasTiltedForward();
+-
+-  // Returns true once per tilt-back gesture (previous page direction).
+-  // Consumed on read.
+-  bool wasTiltedBack();
+-
+-  // Non-consuming: true if any tilt activity occurred since last call.
+-  // Used to reset the auto-sleep inactivity timer.
+-  bool hadActivity();
+-
+-  // Discard any pending tilt events (call when leaving reader or disabling tilt).
+-  void clearPendingEvents();
+-};
+diff -ruN hal_a/hal/HalTouch.cpp hal_b/hal/HalTouch.cpp
+--- hal_a/hal/HalTouch.cpp	1970-01-01 00:00:00.000000000 +0000
++++ hal_b/hal/HalTouch.cpp	2026-07-16 23:12:38.021301622 +0000
+@@ -0,0 +1,46 @@
++#include "HalTouch.h"
++
++bool HalTouch::begin(int sda, int scl, int intPin, uint8_t addr) {
++  if (_initialized) {
++    return true;
++  }
++
++  auto cfg = touch.config();
++  cfg.pin_sda = sda;
++  cfg.pin_scl = scl;
++  cfg.pin_int = intPin;
++  cfg.i2c_port = 1;
++  cfg.i2c_addr = addr;
++  cfg.freq = 400000;
++  cfg.x_min = 0;
++  cfg.x_max = 539;
++  cfg.y_min = 0;
++  cfg.y_max = 959;
++  cfg.offset_rotation = 1;
++  cfg.bus_shared = false;
++  touch.config(cfg);
++
++  _initialized = touch.init();
++  if (Serial) {
++    Serial.printf("[%lu] HalTouch: GT911 touch %s\n", millis(), _initialized ? "OK" : "FAIL");
++  }
++  return _initialized;
++}
++
++bool HalTouch::update() {
++  _touched = false;
++  _numPoints = 0;
++
++  if (!_initialized) return false;
++
++  lgfx::touch_point_t points[5];
++  _numPoints = touch.getTouchRaw(points, 5);
++
++  if (_numPoints > 0) {
++    _x = points[0].x;
++    _y = points[0].y;
++    _touched = true;
++  }
++
++  return _touched;
++}
+diff -ruN hal_a/hal/HalTouch.h hal_b/hal/HalTouch.h
+--- hal_a/hal/HalTouch.h	1970-01-01 00:00:00.000000000 +0000
++++ hal_b/hal/HalTouch.h	2026-07-16 23:12:38.021340699 +0000
+@@ -0,0 +1,32 @@
++#pragma once
++
++#include <Arduino.h>
++
++#include <lgfx/v1/touch/Touch_GT911.hpp>
++
++// Minimal GT911 capacitive touch driver for M5PaperS3
++// Uses the official M5Unified touch driver for M5PaperS3.
++class HalTouch {
++ public:
++  HalTouch() = default;
++
++  // Initialize the touch driver. Returns true on success.
++  bool begin(int sda = 41, int scl = 42, int intPin = 48, uint8_t addr = 0x14);
++
++  // Poll touch state. Call once per frame. Returns true if a touch is active.
++  bool update();
++
++  bool isTouched() const { return _touched; }
++  uint8_t getNumPoints() const { return _numPoints; }
++  int16_t getX() const { return _x; }
++  int16_t getY() const { return _y; }
++
++ private:
++  lgfx::Touch_GT911 touch;
++  int16_t _x = 0;
++  int16_t _y = 0;
++  uint8_t _numPoints = 0;
++  bool _touched = false;
++  unsigned long _lastTouchMs = 0;
++  bool _initialized = false;
++};
+diff -ruN hal_a/platformio.ini hal_b/platformio.ini
+--- hal_a/platformio.ini	2026-07-16 23:12:38.025077114 +0000
++++ hal_b/platformio.ini	2026-07-16 23:12:38.026393851 +0000
+@@ -1,14 +1,13 @@
+ [platformio]
+ default_envs = default
+-build_cache_dir = .cache
+ extra_configs = platformio.local.ini
+ 
+ [crosspoint]
+-version = 1.4.1
++version = 1.3.2
+ 
+ [base]
+ platform = https://github.com/pioarduino/platform-espressif32/releases/download/55.03.37/platform-espressif32.zip
+-board = esp32-c3-devkitm-1
++board = esp32-s3-devkitm-1
+ framework = arduino
+ monitor_speed = 115200
+ upload_speed = 921600
+@@ -23,80 +22,65 @@
+ build_flags =
+   -DARDUINO_USB_MODE=1
+   -DARDUINO_USB_CDC_ON_BOOT=1
+-  -DEINK_DISPLAY_SINGLE_BUFFER_MODE=1
+   -DDISABLE_FS_H_WARNING=1
+   -DDESTRUCTOR_CLOSES_FILE=1
+ # https://libexpat.github.io/doc/api/latest/#XML_GE
+   -DXML_GE=0
+   -DXML_CONTEXT_BYTES=1024
+   -std=gnu++2a
++# Optimize for speed — ESP32-S3 has 16MB flash, -O2 speeds up JPEG/image/font processing
++  -O2
+ # Enable UTF-8 long file names in SdFat
+   -DUSE_UTF8_LONG_NAMES=1
+ # Increase PNG scanline buffer to support up to 2048px wide images
+ # Default is (320*4+1)*2=2562, we need more for larger images
+   -DPNG_MAX_BUFFERED_PIXELS=16416
+-  -DFREEINK_DEVICE_X4=1
+-  -DFREEINK_DEVICE_X3=1
+-  -DFREEINK_NET_WOLFSSL=1
+-  -DWOLFSSL_USER_SETTINGS
+-  -DWOLFSSL_OPTIONS_H
+-  -DWOLFSSL_CLIENT_EXAMPLE
+-  -DWOLFSSL_TLS13
+-  -DWOLFSSL_SP_RISCV32
+-  -DHAVE_TLS_EXTENSIONS
+-  -DHAVE_SUPPORTED_CURVES
+-  -DHAVE_HKDF
+-  -DHAVE_FFDHE_2048
+-  -DHAVE_CURVE25519
+-  -DWC_RSA_PSS
+-  -DHAVE_SNI
+   -Wno-bidi-chars
+-  -Wl,--wrap=panic_print_backtrace,--wrap=panic_abort,--wrap=bootloader_common_check_efuse_blk_validity
+   -fno-exceptions
++# M5PaperS3 target
++  -DCROSSPOINT_PAPERS3=1
++  -DEPD_PAINTER_PRESET_M5PAPER_S3=1
++  -DBOARD_HAS_PSRAM=1
++# M5PaperS3 SD card SPI pins
++  -DPAPERS3_SD_CS=47
++  -DPAPERS3_SD_SCK=39
++  -DPAPERS3_SD_MOSI=38
++  -DPAPERS3_SD_MISO=40
++# ESP32-S3 OPI PSRAM
++  -DCONFIG_SPIRAM_MODE_OCT=1
+ 
+ build_unflags =
+   -std=gnu++11
+   -fexceptions
++  -Os
+ 
+ ; Board configuration
+ board_build.flash_mode = dio
+ board_build.flash_size = 16MB
+ board_build.partitions = partitions.csv
++board_build.arduino.memory_type = qio_opi
+ 
+ extra_scripts =
+-  pre:scripts/patch_wolfssl.py
+   pre:scripts/build_html.py
+   pre:scripts/gen_i18n.py
+   pre:scripts/git_branch.py
+-  pre:scripts/patch_jpegdec.py
+-  post:scripts/register_unit_tests_target.py
+ 
+ ; Libraries
+ lib_deps =
+-  BatteryMonitor=symlink://freeink-sdk/libs/hardware/BatteryMonitor
+-  InputManager=symlink://freeink-sdk/libs/hardware/InputManager
+-  EInkDisplay=symlink://freeink-sdk/libs/display/FreeInkDisplay
+-  SDCardManager=symlink://freeink-sdk/libs/hardware/SDCardManager
+-  BoardConfig=symlink://freeink-sdk/libs/hardware/BoardConfig
+-  PowerManager=symlink://freeink-sdk/libs/hardware/PowerManager
+-  SecureNet=symlink://freeink-sdk/libs/network/SecureNet
+-  FreeInkUI=symlink://freeink-sdk/libs/ui/FreeInkUI
+-  Icons=symlink://freeink-sdk/libs/assets/Icons
++  greiman/SdFat @ ^2.2.3
+   bblanchon/ArduinoJson @ 7.4.2
+   ricmoo/QRCode @ 0.0.1
+-  bitbank2/PNGdec @ 1.1.6
++  bitbank2/PNGdec @ ^1.0.0
+   https://github.com/bitbank2/JPEGDEC.git#86282979224c8a32fd51e091ed5a35b0c699a52b
+   links2004/WebSockets @ 2.7.3
+-  wolfssl/Arduino-wolfSSL @ 5.7.2
+-
+-lib_ignore =
+-  BLE
++  m5stack/M5Unified @ ^0.2.5
++  m5stack/M5GFX @ ^0.2.7
+ 
+ [env:default]
+ extends = base
+ build_flags =
+   ${base.build_flags}
+-  ; CROSSPOINT_VERSION is set by scripts/git_branch.py (includes branch + short SHA)
++  ; CROSSPOINT_VERSION is set by scripts/git_branch.py (includes current branch)
+   -DENABLE_SERIAL_LOG
+   -DLOG_LEVEL=2 ; Set log level to debug for development builds
+ 
+@@ -115,7 +99,7 @@
+   ${base.build_flags}
+   -DCROSSPOINT_VERSION=\"${crosspoint.version}-rc+${sysenv.CROSSPOINT_RC_HASH}\"
+   -DENABLE_SERIAL_LOG
+-  -DLOG_LEVEL=1 ; Set log level to info for release candidate builds
++  -DLOG_LEVEL=1 ; Set log level to info for release candidate builds  
+ 
+ [env:slim]
+ extends = base

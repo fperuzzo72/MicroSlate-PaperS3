@@ -1,0 +1,2047 @@
+diff --git a/lib/hal/HalGPIO.cpp b/lib/hal/HalGPIO.cpp
+index 0ca9352..af9dd7c 100644
+--- a/lib/hal/HalGPIO.cpp
++++ b/lib/hal/HalGPIO.cpp
+@@ -1,129 +1,242 @@
+ #include <HalGPIO.h>
+-#include <Preferences.h>
+ #include <SPI.h>
+ #include <esp_sleep.h>
+ 
+-void HalGPIO::begin() {
+-  inputMgr.begin();
+-  SPI.begin(EPD_SCLK, SPI_MISO, EPD_MOSI, EPD_CS);
+-  // BAT_GPIO0 is configured for ADC via adc1_config_channel_atten in InputManager::begin()
+-  // — do NOT call pinMode() here as it reconfigures the pin as digital input in dual framework
+-  pinMode(UART0_RXD, INPUT);
++// Touch zones in LOGICAL portrait coordinates (540 wide x 960 tall).
++// The physical display is 960x540 landscape; the renderer rotates to portrait.
++// GT911 on M5PaperS3 reports in portrait: x[0-539], y[0-959].
++static constexpr int16_t PORT_W = 540;
++static constexpr int16_t PORT_H = 960;
++
++static void getLogicalDimensions(uint8_t orientation, int16_t* outWidth, int16_t* outHeight) {
++  switch (orientation) {
++    case 1:  // LandscapeClockwise
++    case 3:  // LandscapeCounterClockwise
++      *outWidth = PORT_H;
++      *outHeight = PORT_W;
++      break;
++    case 0:  // Portrait
++    case 2:  // PortraitInverted
++    default:
++      *outWidth = PORT_W;
++      *outHeight = PORT_H;
++      break;
++  }
+ }
+ 
+-void HalGPIO::update() { inputMgr.update(); }
++void HalGPIO::transformTouchPoint(int16_t rawX, int16_t rawY, int16_t* outX, int16_t* outY) const {
++  switch (touchOrientation) {
++    case 1:  // LandscapeClockwise
++      *outX = PORT_H - 1 - rawY;
++      *outY = rawX;
++      break;
++    case 2:  // PortraitInverted
++      *outX = PORT_W - 1 - rawX;
++      *outY = PORT_H - 1 - rawY;
++      break;
++    case 3:  // LandscapeCounterClockwise
++      *outX = rawY;
++      *outY = PORT_W - 1 - rawX;
++      break;
++    case 0:  // Portrait
++    default:
++      *outX = rawX;
++      *outY = rawY;
++      break;
++  }
++}
+ 
+-bool HalGPIO::isPressed(uint8_t buttonIndex) const { return inputMgr.isPressed(buttonIndex); }
++void HalGPIO::begin() {
++  SPI.begin(PAPERS3_SD_SCK, PAPERS3_SD_MISO, PAPERS3_SD_MOSI, PAPERS3_SD_CS);
++  if (!touch.begin(41, 42, 48, 0x14)) {
++    Serial.println("[GPIO] GT911 touch init failed");
++  }
++}
+ 
+-bool HalGPIO::wasPressed(uint8_t buttonIndex) const { return inputMgr.wasPressed(buttonIndex); }
++int16_t HalGPIO::getLastTouchX() const {
++  int16_t logicalX = 0, logicalY = 0;
++  transformTouchPoint(lastTouchX, lastTouchY, &logicalX, &logicalY);
++  return logicalX;
++}
+ 
+-bool HalGPIO::wasAnyPressed() const { return inputMgr.wasAnyPressed(); }
++int16_t HalGPIO::getLastTouchY() const {
++  int16_t logicalX = 0, logicalY = 0;
++  transformTouchPoint(lastTouchX, lastTouchY, &logicalX, &logicalY);
++  return logicalY;
++}
+ 
+-bool HalGPIO::wasReleased(uint8_t buttonIndex) const { return inputMgr.wasReleased(buttonIndex); }
++int HalGPIO::touchZoneToButton(int16_t touchX, int16_t touchY) const {
++  int16_t logicalX = 0, logicalY = 0;
++  transformTouchPoint(touchX, touchY, &logicalX, &logicalY);
+ 
+-bool HalGPIO::wasAnyReleased() const { return inputMgr.wasAnyReleased(); }
++  int16_t logicalW = 0, logicalH = 0;
++  getLogicalDimensions(touchOrientation, &logicalW, &logicalH);
+ 
+-unsigned long HalGPIO::getHeldTime() const { return inputMgr.getHeldTime(); }
++  if (logicalX < 0 || logicalX >= logicalW || logicalY < 0 || logicalY >= logicalH) return -1;
+ 
+-void HalGPIO::startDeepSleep() {
+-  // Ensure that the power button has been released to avoid immediately turning back on if you're holding it
+-  while (inputMgr.isPressed(BTN_POWER)) {
+-    delay(50);
+-    inputMgr.update();
++  // Header bar (top, permanent): 4 equal zones — Home / reserved / reserved / Sleep.
++  // Substitutes the physical power button's short-press (Home) and
++  // long-press (Sleep), neither of which exist on PaperS3 (see class doc).
++  if (headerHeight > 0 && logicalY < headerHeight) {
++    const int16_t quarter = logicalW / 4;
++    if (logicalX < quarter) return BTN_HOME;
++    if (logicalX >= quarter * 3) return BTN_SLEEP;
++    return -1;  // reserved middle zones — no button yet (future status icons)
+   }
+-  // Arm the wakeup trigger *after* the button is released
+-  esp_deep_sleep_enable_gpio_wakeup(1ULL << InputManager::POWER_BUTTON_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+-  // Enter Deep Sleep
+-  esp_deep_sleep_start();
+-}
+ 
+-int HalGPIO::getBatteryPercentage() const {
+-  static const BatteryMonitor battery = BatteryMonitor(BAT_GPIO0);
+-  static int cachedPct = -1;
+-  static float smoothedMv = -1.0f;
+-  static unsigned long lastReadMs = 0;
+-  static bool adcSettled = false;
+-
+-  // On first call, load the last persisted reading so we don't show a stale default
+-  if (cachedPct < 0) {
+-    Preferences prefs;
+-    prefs.begin("battery", true);  // read-only
+-    cachedPct = prefs.getInt("pct", -1);
+-    prefs.end();
++  // Footer bar (bottom, permanent): 4 equal zones — Back / Confirm / Up / Down.
++  if (footerHeight > 0 && logicalY >= logicalH - footerHeight) {
++    const int16_t quarter = logicalW / 4;
++    if (logicalX < quarter) return BTN_BACK;
++    if (logicalX < quarter * 2) return BTN_CONFIRM;
++    if (logicalX < quarter * 3) return BTN_UP;
++    return BTN_DOWN;
+   }
+ 
+-  unsigned long now = millis();
++  // Content area (between header and footer): plain taps are inert here —
++  // navigation goes through header/footer taps and horizontal swipes only
++  // (classified on release in update(), producing BTN_LEFT/BTN_RIGHT).
++  return -1;
++}
+ 
+-  const bool usbCharging = isUsbConnected();
++void HalGPIO::update() {
++  previousState = currentState;
++  currentState = 0;
+ 
+-  // ADC reads high for ~2 minutes after boot/wake — trust NVS cache during settling.
+-  // Skip this window when charging: voltage is actively changing and we want real readings.
+-  if (!adcSettled) {
+-    if (!usbCharging && now < 120000) {
+-      // Still settling — return NVS cached value if we have one
+-      if (cachedPct >= 0) return cachedPct;
+-      // No NVS value at all — fall through to read ADC (better than showing nothing)
+-    }
+-    adcSettled = true;
++  if (millis() < cooldownUntil) {
++    touch.update();
++    touchActive = false;
++    sawMultiTouch = false;
++    return;
+   }
+ 
+-  // Battery voltage changes on a timescale of minutes — no need to read every frame
+-  if (cachedPct < 0 || (now - lastReadMs) >= 30000) {
+-    float rawMv = static_cast<float>(battery.readMillivolts());
+-
+-    // EMA smoothing on millivolts (before the nonlinear polynomial).
+-    // Alpha=0.3 means ~70% weight on history — takes ~5 reads (~2.5 min) to converge,
+-    // which rejects brief voltage spikes from charging cycles / SPI / BLE noise.
+-    // When charging, use alpha=1.0 (no smoothing) so voltage tracks in real time.
+-    if (smoothedMv < 0) {
+-      smoothedMv = rawMv;  // seed with first real reading
+-    } else if (usbCharging) {
+-      smoothedMv = rawMv;  // no smoothing while charging
+-    } else {
+-      smoothedMv = 0.3f * rawMv + 0.7f * smoothedMv;
+-    }
++  bool touching = touch.update();
++  uint8_t numPoints = touch.getNumPoints();
++
++  if (touching) {
++    lastTouchX = touch.getX();
++    lastTouchY = touch.getY();
+ 
+-    int newPct = BatteryMonitor::percentageFromMillivolts(static_cast<uint16_t>(smoothedMv));
++    if (numPoints >= 2) sawMultiTouch = true;
+ 
+-    // Rate-limit drops only: max 2% decrease per read cycle (every 30s) on battery.
+-    // Rising is uncapped so the display catches up quickly after charging.
+-    // When charging via USB, drops are also uncapped (voltage actively rising anyway).
+-    if (cachedPct >= 0) {
+-      const int maxDrop = usbCharging ? 20 : 2;
+-      if (newPct < cachedPct - maxDrop) newPct = cachedPct - maxDrop;
++    if (!touchActive) {
++      touchActive = true;
++      touchStartX = lastTouchX;
++      touchStartY = lastTouchY;
+     }
+ 
+-    if (newPct != cachedPct) {
+-      Preferences prefs;
+-      prefs.begin("battery", false);
+-      prefs.putInt("pct", newPct);
+-      prefs.end();
++    // While the finger is down, report the zone locked to the touch-down
++    // position (not the live position) so it doesn't flicker across a zone
++    // boundary if the finger drifts slightly — needed for getHeldTime().
++    int btn = touchZoneToButton(touchStartX, touchStartY);
++    if (btn >= 0 && btn < HALGPIO_NUM_BUTTONS) {
++      currentState |= (1 << btn);
+     }
+-    cachedPct = newPct;
+-    lastReadMs = now;
++  } else if (touchActive) {
++    lastHeldTime = millis() - pressStartTime;
++    touchActive = false;
++
++    if (sawMultiTouch) {
++      // 2-finger tap → Back, available anywhere (in addition to the footer's
++      // Back zone) since it's a deliberate two-finger gesture, unlikely to
++      // fire by accident.
++      currentState |= (1 << BTN_BACK);
++      currentState |= (1 << BTN_TWO_FINGER);
++    } else {
++      // Did the touch start on the header or footer? If so, this is a plain
++      // tap on that bar — always resolve by zone, no gesture classification
++      // (dragging a finger off a header/footer button shouldn't accidentally
++      // register as a swipe).
++      int startBtn = touchZoneToButton(touchStartX, touchStartY);
++      bool startedOnChrome = (startBtn == BTN_HOME || startBtn == BTN_SLEEP || startBtn == BTN_BACK ||
++                               startBtn == BTN_CONFIRM || startBtn == BTN_UP || startBtn == BTN_DOWN);
++
++      if (startedOnChrome) {
++        if (startBtn >= 0 && startBtn < HALGPIO_NUM_BUTTONS) currentState |= (1 << startBtn);
++      } else {
++        // Content area: horizontal swipe -> Left/Right (text editor cursor
++        // movement). Vertical swipe -> Up/Down kept as a secondary path for
++        // future use; plain taps in the content area are inert.
++        int16_t startLogicalX = 0, startLogicalY = 0, lastLogicalX = 0, lastLogicalY = 0;
++        transformTouchPoint(touchStartX, touchStartY, &startLogicalX, &startLogicalY);
++        transformTouchPoint(lastTouchX, lastTouchY, &lastLogicalX, &lastLogicalY);
++        int16_t deltaX = lastLogicalX - startLogicalX;
++        int16_t deltaY = lastLogicalY - startLogicalY;
++
++        if (abs(deltaX) > SWIPE_THRESHOLD && abs(deltaX) >= abs(deltaY)) {
++          currentState |= (1 << (deltaX < 0 ? BTN_LEFT : BTN_RIGHT));
++        } else if (deltaY < -SWIPE_THRESHOLD) {
++          currentState |= (1 << BTN_SWIPE_UP);
++          currentState |= (1 << BTN_UP);
++        } else if (deltaY > SWIPE_THRESHOLD) {
++          currentState |= (1 << BTN_SWIPE_DOWN);
++          currentState |= (1 << BTN_DOWN);
++        }
++        // else: short tap in content area, below swipe threshold — inert.
++      }
++    }
++
++    sawMultiTouch = false;
+   }
+-  return cachedPct;
++
++  uint16_t newPresses = currentState & ~previousState;
++  if (newPresses) pressStartTime = millis();
++}
++
++void HalGPIO::clearState() {
++  previousState = 0;
++  currentState = 0;
++  pressStartTime = 0;
++  lastHeldTime = 0;
++  touchActive = false;
++  sawMultiTouch = false;
++  cooldownUntil = millis() + 200;  // Suppress input for 200ms after a screen transition
++}
++
++bool HalGPIO::isPressed(uint8_t buttonIndex) const {
++  if (buttonIndex >= HALGPIO_NUM_BUTTONS) return false;
++  return currentState & (1 << buttonIndex);
++}
++
++bool HalGPIO::wasPressed(uint8_t buttonIndex) const {
++  if (buttonIndex >= HALGPIO_NUM_BUTTONS) return false;
++  return (currentState & (1 << buttonIndex)) && !(previousState & (1 << buttonIndex));
++}
++
++bool HalGPIO::wasAnyPressed() const { return (currentState & ~previousState) != 0; }
++
++bool HalGPIO::wasReleased(uint8_t buttonIndex) const {
++  if (buttonIndex >= HALGPIO_NUM_BUTTONS) return false;
++  return !(currentState & (1 << buttonIndex)) && (previousState & (1 << buttonIndex));
++}
++
++bool HalGPIO::wasAnyReleased() const { return (previousState & ~currentState) != 0; }
++
++unsigned long HalGPIO::getHeldTime() const {
++  if (currentState == 0) return lastHeldTime;
++  return millis() - pressStartTime;
++}
++
++// --- TODO(papers3-power): stubs below need real PaperS3 implementations ---
++// The X4 build read battery voltage from a raw ADC pin and used
++// esp_deep_sleep_enable_gpio_wakeup() tied to a physical power button GPIO.
++// Neither exists on PaperS3: battery/charge state lives behind the onboard
++// PMIC and RTC (BM8563), normally read through M5Unified. Left unimplemented
++// on purpose — this port only covers input (touch → button mapping).
++
++void HalGPIO::startDeepSleep() {
++  Serial.println("[GPIO] startDeepSleep() not yet implemented for PaperS3");
++  esp_deep_sleep_start();
++}
++
++int HalGPIO::getBatteryPercentage() const {
++  return 100;  // placeholder until PaperS3 power HAL is written
+ }
+ 
+ bool HalGPIO::isUsbConnected() const {
+-  // U0RXD/GPIO20 reads HIGH when USB is connected
+-  return digitalRead(UART0_RXD) == HIGH;
++  return Serial;  // ARDUINO_USB_CDC_ON_BOOT=1 → Serial reflects USB CDC connection
+ }
+ 
+ HalGPIO::WakeupReason HalGPIO::getWakeupReason() const {
+-  const bool usbConnected = isUsbConnected();
+-  const auto wakeupCause = esp_sleep_get_wakeup_cause();
+-  const auto resetReason = esp_reset_reason();
+-
+-  if ((wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON && !usbConnected) ||
+-      (wakeupCause == ESP_SLEEP_WAKEUP_GPIO && resetReason == ESP_RST_DEEPSLEEP && usbConnected)) {
+-    return WakeupReason::PowerButton;
+-  }
+-  if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_UNKNOWN && usbConnected) {
+-    return WakeupReason::AfterFlash;
+-  }
+-  if (wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON && usbConnected) {
+-    return WakeupReason::AfterUSBPower;
+-  }
+-  return WakeupReason::Other;
++  return WakeupReason::Other;  // placeholder until PaperS3 power HAL is written
+ }
+diff --git a/lib/hal/HalGPIO.h b/lib/hal/HalGPIO.h
+index 615a8d6..eda2579 100644
+--- a/lib/hal/HalGPIO.h
++++ b/lib/hal/HalGPIO.h
+@@ -1,36 +1,57 @@
+ #pragma once
+ 
+ #include <Arduino.h>
+-#include <BatteryMonitor.h>
+-#include <InputManager.h>
++#include <HalTouch.h>
+ 
+-// Display SPI pins (custom pins for XteinkX4, not hardware SPI defaults)
+-#define EPD_SCLK 8   // SPI Clock
+-#define EPD_MOSI 10  // SPI MOSI (Master Out Slave In)
+-#define EPD_CS 21    // Chip Select
+-#define EPD_DC 4     // Data/Command
+-#define EPD_RST 5    // Reset
+-#define EPD_BUSY 6   // Busy
+-
+-#define SPI_MISO 7  // SPI MISO, shared between SD card and display (Master In Slave Out)
+-
+-#define BAT_GPIO0 0  // Battery voltage
++// M5PaperS3 SD card SPI pins (set via build_flags in platformio.ini)
++#ifndef PAPERS3_SD_CS
++#define PAPERS3_SD_CS 47
++#define PAPERS3_SD_SCK 39
++#define PAPERS3_SD_MOSI 38
++#define PAPERS3_SD_MISO 40
++#endif
+ 
+ #define UART0_RXD 20  // Used for USB connection detection
+ 
+-class HalGPIO {
+-#if CROSSPOINT_EMULATED == 0
+-  InputManager inputMgr;
+-#endif
++// Number of virtual buttons (touch zones + gestures + header + power substitutes)
++#define HALGPIO_NUM_BUTTONS 12
+ 
++// PaperS3 port of MicroSlate's button HAL.
++//
++// The X4 build of this class wrapped InputManager (ADC reads of physical
++// buttons, including a physical power button). The PaperS3 has no physical
++// buttons at all — everything below is synthesized from GT911 touch input.
++// The public interface (button indices + isPressed/wasPressed/wasReleased/
++// getHeldTime) is kept identical to the X4 version on purpose: src/main.cpp
++// reads buttons exclusively through this interface and needs no changes to
++// its state-machine logic.
++//
++// Layout: header and footer bars are permanent viewport chrome — always
++// reserved, on every screen, so screens don't need to reason about touch
++// zones changing shape:
++//   - Footer (bottom bar, 4 equal zones): Back / Confirm / Up / Down.
++//     Replaces the old 3-zone content split + vertical swipe entirely.
++//   - Header (top bar, 4 equal zones): Home / (reserved) / (reserved) /
++//     Sleep. Substitutes for the physical power button's short-press
++//     (-> home) and long-press (-> sleep), which don't exist on PaperS3 —
++//     its power button cuts power directly in hardware and isn't readable
++//     by software. The two reserved middle zones are inert for now (no
++//     button is produced); earmarked for status icons (battery/BLE/WiFi)
++//     later, matching the footer's 4-zone rhythm.
++//   - Content area (between header and footer): horizontal swipe only,
++//     producing Left/Right — needed for cursor movement in the text editor,
++//     since the footer no longer exposes Left/Right taps. Plain taps in
++//     the content area are inert (no button produced).
++class HalGPIO {
+  public:
+   HalGPIO() = default;
+ 
+-  // Start button GPIO and setup SPI for screen and SD card
++  // Start touch input (GT911) and SD card SPI
+   void begin();
+ 
+-  // Button input methods
++  // Button input methods (touch zones mapped to virtual buttons)
+   void update();
++  void clearState();  // Reset button state (call during activity/screen transitions)
+   bool isPressed(uint8_t buttonIndex) const;
+   bool wasPressed(uint8_t buttonIndex) const;
+   bool wasAnyPressed() const;
+@@ -38,25 +59,78 @@ class HalGPIO {
+   bool wasAnyReleased() const;
+   unsigned long getHeldTime() const;
+ 
+-  // Setup wake up GPIO and enter deep sleep
+-  void startDeepSleep();
++  // Raw touch coordinate access (for tap-to-select in file browser, etc.)
++  int16_t getLastTouchX() const;
++  int16_t getLastTouchY() const;
+ 
+-  // Get battery percentage (range 0-100)
++  // Header and footer are permanent chrome: set once at startup (see
++  // main.cpp setup()), not toggled per screen. Kept as setters rather than
++  // fixed constants so orientation changes / future layout tuning don't
++  // require touching HalGPIO internals.
++  void setFooterHeight(int16_t height) { footerHeight = height; }
++  int16_t getFooterHeight() const { return footerHeight; }
++  void setHeaderHeight(int16_t height) { headerHeight = height; }
++  int16_t getHeaderHeight() const { return headerHeight; }
++  void setTouchOrientation(uint8_t orientation) { touchOrientation = orientation; }
++
++  // TODO(papers3-power): startDeepSleep() enters sleep but wake-source
++  // config (X4 used a GPIO wakeup tied to the physical power button) still
++  // needs a PaperS3 equivalent — likely a touch-interrupt or RTC (BM8563)
++  // wake, not written yet. getBatteryPercentage() is also stubbed: X4 read
++  // a raw ADC pin, PaperS3 battery/charge state lives behind the onboard
++  // PMIC, normally read through M5Unified. Both out of scope for this
++  // input-only port; entry into startDeepSleep() itself is already wired
++  // up to the BTN_SLEEP header zone in main.cpp.
++  void startDeepSleep();
+   int getBatteryPercentage() const;
+ 
+   // Check if USB is connected
+   bool isUsbConnected() const;
+ 
+   enum class WakeupReason { PowerButton, AfterFlash, AfterUSBPower, Other };
+-
+   WakeupReason getWakeupReason() const;
+ 
+-  // Button indices
+-  static constexpr uint8_t BTN_BACK = 0;
+-  static constexpr uint8_t BTN_CONFIRM = 1;
+-  static constexpr uint8_t BTN_LEFT = 2;
+-  static constexpr uint8_t BTN_RIGHT = 3;
+-  static constexpr uint8_t BTN_UP = 4;
+-  static constexpr uint8_t BTN_DOWN = 5;
+-  static constexpr uint8_t BTN_POWER = 6;
++  // Button indices — BTN_BACK..BTN_TWO_FINGER keep the same values as the
++  // X4 build so callers don't change. BTN_POWER is gone (nothing produces
++  // it — see class comment); BTN_HOME/BTN_SLEEP are its header-zone
++  // substitutes.
++  static constexpr uint8_t BTN_BACK = 0;        // Footer Q1 tap, or 2-finger tap anywhere
++  static constexpr uint8_t BTN_CONFIRM = 1;     // Footer Q2 tap
++  static constexpr uint8_t BTN_LEFT = 2;        // Horizontal swipe left (content area)
++  static constexpr uint8_t BTN_RIGHT = 3;       // Horizontal swipe right (content area)
++  static constexpr uint8_t BTN_UP = 4;          // Footer Q3 tap
++  static constexpr uint8_t BTN_DOWN = 5;        // Footer Q4 tap
++  static constexpr uint8_t BTN_SWIPE_UP = 7;    // Vertical swipe up (kept for future use)
++  static constexpr uint8_t BTN_SWIPE_DOWN = 8;  // Vertical swipe down (kept for future use)
++  static constexpr uint8_t BTN_TWO_FINGER = 9;  // 2-finger tap (also sets BTN_BACK)
++  static constexpr uint8_t BTN_HOME = 10;       // Header Q1 tap — substitutes power short-press
++  static constexpr uint8_t BTN_SLEEP = 11;      // Header Q4 hold — substitutes power long-press
++
++ private:
++  int touchZoneToButton(int16_t touchX, int16_t touchY) const;
++  void transformTouchPoint(int16_t rawX, int16_t rawY, int16_t* outX, int16_t* outY) const;
++
++  HalTouch touch;
++
++  uint16_t currentState = 0;
++  uint16_t previousState = 0;
++  unsigned long pressStartTime = 0;
++  unsigned long lastHeldTime = 0;
++  unsigned long cooldownUntil = 0;
++
++  int16_t lastTouchX = -1;
++  int16_t lastTouchY = -1;
++
++  bool touchActive = false;
++  int16_t touchStartX = -1;
++  int16_t touchStartY = -1;
++  bool sawMultiTouch = false;
++  static constexpr int16_t SWIPE_THRESHOLD = 50;
++
++  int16_t footerHeight = 0;
++  int16_t headerHeight = 0;
++  uint8_t touchOrientation = 0;
+ };
++
++// Global singleton — defined in src/main.cpp.
++extern HalGPIO gpio;
+diff --git a/lib/hal/HalTouch.cpp b/lib/hal/HalTouch.cpp
+new file mode 100644
+index 0000000..02e3a0f
+--- /dev/null
++++ b/lib/hal/HalTouch.cpp
+@@ -0,0 +1,46 @@
++#include "HalTouch.h"
++
++bool HalTouch::begin(int sda, int scl, int intPin, uint8_t addr) {
++  if (_initialized) {
++    return true;
++  }
++
++  auto cfg = touch.config();
++  cfg.pin_sda = sda;
++  cfg.pin_scl = scl;
++  cfg.pin_int = intPin;
++  cfg.i2c_port = 1;
++  cfg.i2c_addr = addr;
++  cfg.freq = 400000;
++  cfg.x_min = 0;
++  cfg.x_max = 539;
++  cfg.y_min = 0;
++  cfg.y_max = 959;
++  cfg.offset_rotation = 1;
++  cfg.bus_shared = false;
++  touch.config(cfg);
++
++  _initialized = touch.init();
++  if (Serial) {
++    Serial.printf("[%lu] HalTouch: GT911 touch %s\n", millis(), _initialized ? "OK" : "FAIL");
++  }
++  return _initialized;
++}
++
++bool HalTouch::update() {
++  _touched = false;
++  _numPoints = 0;
++
++  if (!_initialized) return false;
++
++  lgfx::touch_point_t points[5];
++  _numPoints = touch.getTouchRaw(points, 5);
++
++  if (_numPoints > 0) {
++    _x = points[0].x;
++    _y = points[0].y;
++    _touched = true;
++  }
++
++  return _touched;
++}
+diff --git a/lib/hal/HalTouch.h b/lib/hal/HalTouch.h
+new file mode 100644
+index 0000000..de08c18
+--- /dev/null
++++ b/lib/hal/HalTouch.h
+@@ -0,0 +1,32 @@
++#pragma once
++
++#include <Arduino.h>
++
++#include <lgfx/v1/touch/Touch_GT911.hpp>
++
++// Minimal GT911 capacitive touch driver for M5PaperS3
++// Uses the official M5Unified touch driver for M5PaperS3.
++class HalTouch {
++ public:
++  HalTouch() = default;
++
++  // Initialize the touch driver. Returns true on success.
++  bool begin(int sda = 41, int scl = 42, int intPin = 48, uint8_t addr = 0x14);
++
++  // Poll touch state. Call once per frame. Returns true if a touch is active.
++  bool update();
++
++  bool isTouched() const { return _touched; }
++  uint8_t getNumPoints() const { return _numPoints; }
++  int16_t getX() const { return _x; }
++  int16_t getY() const { return _y; }
++
++ private:
++  lgfx::Touch_GT911 touch;
++  int16_t _x = 0;
++  int16_t _y = 0;
++  uint8_t _numPoints = 0;
++  bool _touched = false;
++  unsigned long _lastTouchMs = 0;
++  bool _initialized = false;
++};
+diff --git a/src/dead_keys.h b/src/dead_keys.h
+new file mode 100644
+index 0000000..f081e36
+--- /dev/null
++++ b/src/dead_keys.h
+@@ -0,0 +1,193 @@
++#pragma once
++
++// ---------------------------------------------------------------------------
++// dead_keys.h — US-International dead key composition for MicroSlate
++//
++// Implements the five dead keys of the US-International layout:
++//   '  (apostrophe)  → acute accent   : a→á  e→é  i→í  o→ó  u→ú  c→ç
++//   `  (grave)       → grave accent   : a→à  e→è  i→ì  o→ò  u→ù
++//   ~  (tilde)       → tilde          : a→ã  o→õ  n→ñ
++//   ^  (circumflex)  → circumflex     : a→â  e→ê  i→î  o→ô  u→û
++//   "  (diaeresis)   → umlaut/trema   : a→ä  e→ë  i→ï  o→ö  u→ü
++//
++// Usage:
++//   const char* result = deadKeyProcess(ch);
++//   if (result == nullptr)  → insert `ch` normally (no dead key involved)
++//   if (result[0] == '\0')  → dead key stored; insert nothing now
++//   otherwise               → insert the UTF-8 string `result`
++//
++// When a dead key is followed by a non-composable character, the dead key
++// is emitted as a literal via deadKeyFlush(), and the original character
++// is returned via deadKeyPendingChar() for the caller to re-process.
++// ---------------------------------------------------------------------------
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// ---------------------------------------------------------------------------
++// Composition table
++// ---------------------------------------------------------------------------
++
++typedef struct {
++    char dead;
++    char base;
++    const char* result;  // UTF-8 encoded composed character
++} DeadKeyEntry;
++
++static const DeadKeyEntry DEAD_KEY_TABLE[] = {
++    // --- Acute accent  ' ---
++    { '\'', 'a', "\xC3\xA1" },  // á
++    { '\'', 'A', "\xC3\x81" },  // Á
++    { '\'', 'e', "\xC3\xA9" },  // é
++    { '\'', 'E', "\xC3\x89" },  // É
++    { '\'', 'i', "\xC3\xAD" },  // í
++    { '\'', 'I', "\xC3\x8D" },  // Í
++    { '\'', 'o', "\xC3\xB3" },  // ó
++    { '\'', 'O', "\xC3\x93" },  // Ó
++    { '\'', 'u', "\xC3\xBA" },  // ú
++    { '\'', 'U', "\xC3\x9A" },  // Ú
++    { '\'', 'c', "\xC3\xA7" },  // ç
++    { '\'', 'C', "\xC3\x87" },  // Ç
++    { '\'', ' ', "'"         },  // literal apostrophe
++
++    // --- Grave accent  ` ---
++    { '`',  'a', "\xC3\xA0" },  // à
++    { '`',  'A', "\xC3\x80" },  // À
++    { '`',  'e', "\xC3\xA8" },  // è
++    { '`',  'E', "\xC3\x88" },  // È
++    { '`',  'i', "\xC3\xAC" },  // ì
++    { '`',  'I', "\xC3\x8C" },  // Ì
++    { '`',  'o', "\xC3\xB2" },  // ò
++    { '`',  'O', "\xC3\x92" },  // Ò
++    { '`',  'u', "\xC3\xB9" },  // ù
++    { '`',  'U', "\xC3\x99" },  // Ù
++    { '`',  ' ', "`"         },  // literal grave
++
++    // --- Tilde  ~ ---
++    { '~',  'a', "\xC3\xA3" },  // ã
++    { '~',  'A', "\xC3\x83" },  // Ã
++    { '~',  'o', "\xC3\xB5" },  // õ
++    { '~',  'O', "\xC3\x95" },  // Õ
++    { '~',  'n', "\xC3\xB1" },  // ñ
++    { '~',  'N', "\xC3\x91" },  // Ñ
++    { '~',  ' ', "~"         },  // literal tilde
++
++    // --- Circumflex  ^ ---
++    { '^',  'a', "\xC3\xA2" },  // â
++    { '^',  'A', "\xC3\x82" },  // Â
++    { '^',  'e', "\xC3\xAA" },  // ê
++    { '^',  'E', "\xC3\x8A" },  // Ê
++    { '^',  'i', "\xC3\xAE" },  // î
++    { '^',  'I', "\xC3\x8E" },  // Î
++    { '^',  'o', "\xC3\xB4" },  // ô
++    { '^',  'O', "\xC3\x94" },  // Ô
++    { '^',  'u', "\xC3\xBB" },  // û
++    { '^',  'U', "\xC3\x9B" },  // Û
++    { '^',  ' ', "^"         },  // literal circumflex
++
++    // --- Diaeresis / Trema  " ---
++    { '"',  'a', "\xC3\xA4" },  // ä
++    { '"',  'A', "\xC3\x84" },  // Ä
++    { '"',  'e', "\xC3\xAB" },  // ë
++    { '"',  'E', "\xC3\x8B" },  // Ë
++    { '"',  'i', "\xC3\xAF" },  // ï
++    { '"',  'I', "\xC3\x8F" },  // Ï
++    { '"',  'o', "\xC3\xB6" },  // ö
++    { '"',  'O', "\xC3\x96" },  // Ö
++    { '"',  'u', "\xC3\xBC" },  // ü
++    { '"',  'U', "\xC3\x9C" },  // Ü
++    { '"',  ' ', "\""        },  // literal double-quote
++
++    { 0, 0, 0 }  // sentinel
++};
++
++// ---------------------------------------------------------------------------
++// State
++// ---------------------------------------------------------------------------
++
++static char  _dead_pending      = 0;   // the stored dead key, or 0
++static char  _dead_requeue_char = 0;   // char to reprocess after flush
++
++// ---------------------------------------------------------------------------
++// Public API
++// ---------------------------------------------------------------------------
++
++// Returns true if `ch` is one of the five dead keys.
++static inline bool deadKeyIsDeadChar(char ch) {
++    return ch == '\'' || ch == '`' || ch == '~' || ch == '^' || ch == '"';
++}
++
++// Returns true if there is a dead key waiting to be resolved.
++static inline bool deadKeyHasPending() {
++    return _dead_pending != 0;
++}
++
++// Returns the literal string for the pending dead key (so the caller can
++// emit it as-is before emitting the non-composable character).
++// Call only when deadKeyHasPending() is true.
++static inline const char* deadKeyFlush() {
++    static char buf[2];
++    buf[0] = _dead_pending;
++    buf[1] = '\0';
++    _dead_pending = 0;
++    return buf;
++}
++
++// After a flush, call this to retrieve the non-composable character that
++// originally triggered the flush (0 if none).
++static inline char deadKeyTakeRequeue() {
++    char c = _dead_requeue_char;
++    _dead_requeue_char = 0;
++    return c;
++}
++
++// Main entry point.  Call with each printable ASCII character as it arrives.
++//
++// Returns:
++//   nullptr  — no dead key involved; insert `ch` normally
++//   ""       — dead key stored; do not insert anything yet
++//   other    — UTF-8 string to insert (may be 1–3 bytes + NUL)
++//
++// When this returns a non-empty string AND deadKeyTakeRequeue() != 0,
++// the caller must also re-process the requeued character.
++static const char* deadKeyProcess(char ch) {
++    if (_dead_pending != 0) {
++        char dead = _dead_pending;
++        _dead_pending = 0;
++
++        // Search composition table
++        for (int i = 0; DEAD_KEY_TABLE[i].result != 0; i++) {
++            if (DEAD_KEY_TABLE[i].dead == dead && DEAD_KEY_TABLE[i].base == ch) {
++                return DEAD_KEY_TABLE[i].result;  // composed character
++            }
++        }
++
++        // No composition found: emit dead key as literal, requeue `ch`
++        static char flush_buf[2];
++        flush_buf[0] = dead;
++        flush_buf[1] = '\0';
++        _dead_requeue_char = ch;
++        return flush_buf;
++    }
++
++    if (deadKeyIsDeadChar(ch)) {
++        _dead_pending = ch;
++        return "";  // stored; nothing to insert now
++    }
++
++    return nullptr;  // normal character, insert as-is
++}
++
++// Reset dead key state (e.g. on ESC, focus change, or backspace logic).
++static inline void deadKeyReset() {
++    _dead_pending      = 0;
++    _dead_requeue_char = 0;
++}
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/input_handler.cpp b/src/input_handler.cpp
+index 5e43d08..872b940 100644
+--- a/src/input_handler.cpp
++++ b/src/input_handler.cpp
+@@ -3,6 +3,7 @@
+ #include "file_manager.h"
+ #include "ble_keyboard.h"
+ #include "wifi_sync.h"
++#include "dead_keys.h"
+ 
+ #include <Arduino.h>
+ #include <SDCardManager.h>
+@@ -191,6 +192,7 @@ static void handleEditorKey(uint8_t keyCode, uint8_t modifiers) {
+ 
+   // ESC = save and return to file browser
+   if (keyCode == HID_KEY_ESCAPE) {
++    deadKeyReset();  // discard any pending dead key
+     if (editorHasUnsavedChanges()) saveCurrentFile();
+     currentState = UIState::FILE_BROWSER;
+     screenDirty = true;
+@@ -223,11 +225,25 @@ static void handleEditorKey(uint8_t keyCode, uint8_t modifiers) {
+     return;
+   }
+ 
+-  // Printable character
++  // Printable character — process through US-International dead key engine
+   char c = hidToAscii(keyCode, modifiers);
+   if (c != 0) {
+-    editorInsertChar(c);
+-    screenDirty = true;
++    const char* composed = deadKeyProcess(c);
++    if (composed == nullptr) {
++      // No dead key involved: insert normally
++      editorInsertChar(c);
++      screenDirty = true;
++    } else if (composed[0] != '\0') {
++      // Composed result (or flushed dead key literal): insert UTF-8 string
++      editorInsertUtf8(composed);
++      screenDirty = true;
++      // If a non-composable char was requeued, insert it too
++      char req = deadKeyTakeRequeue();
++      if (req != 0) {
++        editorInsertChar(req);
++      }
++    }
++    // else: composed[0] == '\0' → dead key stored, nothing to insert yet
+   }
+ }
+ 
+@@ -270,12 +286,14 @@ static void handleRenameKey(uint8_t keyCode, uint8_t modifiers) {
+   }
+ 
+   if (keyCode == HID_KEY_ESCAPE) {
++    deadKeyReset();  // discard any pending dead key
+     currentState = renameReturnState;
+     screenDirty = true;
+     return;
+   }
+ 
+   if (keyCode == HID_KEY_BACKSPACE) {
++    deadKeyReset();  // dead key + backspace → discard dead key
+     if (renameBufferLen > 0) {
+       renameBufferLen--;
+       renameBuffer[renameBufferLen] = '\0';
+@@ -284,12 +302,33 @@ static void handleRenameKey(uint8_t keyCode, uint8_t modifiers) {
+     return;
+   }
+ 
+-  // Allow all printable characters in a title (including spaces)
++  // Allow all printable characters in a title (including spaces),
++  // processed through the US-International dead key engine.
+   char c = hidToAscii(keyCode, modifiers);
+-  if (c != 0 && c >= ' ' && renameBufferLen < MAX_TITLE_LEN - 1) {
+-    renameBuffer[renameBufferLen++] = c;
+-    renameBuffer[renameBufferLen] = '\0';
+-    screenDirty = true;
++  if (c != 0 && c >= ' ') {
++    const char* composed = deadKeyProcess(c);
++    if (composed == nullptr) {
++      // Normal character
++      if (renameBufferLen < MAX_TITLE_LEN - 1) {
++        renameBuffer[renameBufferLen++] = c;
++        renameBuffer[renameBufferLen] = '\0';
++        screenDirty = true;
++      }
++    } else if (composed[0] != '\0') {
++      // Composed UTF-8 string (1–3 bytes typically): copy each byte
++      for (const char* p = composed; *p != '\0' && renameBufferLen < MAX_TITLE_LEN - 1; p++) {
++        renameBuffer[renameBufferLen++] = *p;
++      }
++      renameBuffer[renameBufferLen] = '\0';
++      screenDirty = true;
++      // If a non-composable char was requeued, insert it too
++      char req = deadKeyTakeRequeue();
++      if (req != 0 && req >= ' ' && renameBufferLen < MAX_TITLE_LEN - 1) {
++        renameBuffer[renameBufferLen++] = req;
++        renameBuffer[renameBufferLen] = '\0';
++      }
++    }
++    // else: dead key stored, nothing to insert yet
+   }
+ }
+ 
+diff --git a/src/main.cpp b/src/main.cpp
+index d202a5d..86bdebf 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -152,6 +152,7 @@ static void updateScreen() {
+       case Orientation::LANDSCAPE_CCW: gfxOrient = GfxRenderer::LandscapeCounterClockwise; break;
+     }
+     renderer.setOrientation(gfxOrient);
++    gpio.setTouchOrientation(static_cast<uint8_t>(gfxOrient));
+     lastOrientation = currentOrientation;
+   }
+ 
+@@ -186,6 +187,14 @@ void setup() {
+   gpio.begin();
+   display.begin();
+ 
++  // Header and footer are permanent viewport chrome on PaperS3 (touch has
++  // no physical buttons) — reserved once here, not toggled per screen.
++  // 80px gives a comfortable tap target on the 960px-tall portrait panel;
++  // ui_renderer.cpp still needs to draw these bars and reserve the matching
++  // content area — that's the next step, this only wires up the input side.
++  gpio.setHeaderHeight(80);
++  gpio.setFooterHeight(80);
++
+   renderer.setFadingFix(true);  // Power down display analog circuits after each refresh — reduces idle drain
+   rendererSetup(renderer);
+ 
+@@ -207,6 +216,7 @@ void setup() {
+       case Orientation::LANDSCAPE_CCW: gfxOrient = GfxRenderer::LandscapeCounterClockwise; break;
+     }
+     renderer.setOrientation(gfxOrient);
++    gpio.setTouchOrientation(static_cast<uint8_t>(gfxOrient));
+   }
+ 
+   editorInit();
+@@ -236,6 +246,7 @@ void setup() {
+         case Orientation::LANDSCAPE_CCW: gfxOrient = GfxRenderer::LandscapeCounterClockwise; break;
+       }
+       renderer.setOrientation(gfxOrient);
++      gpio.setTouchOrientation(static_cast<uint8_t>(gfxOrient));
+       DBG_PRINTLN("UI prefs restored from SD backup");
+     }
+   }
+@@ -298,8 +309,10 @@ static void processPhysicalButtons() {
+   static bool btnConfirmLast = false;
+   static bool btnBackLast = false;
+ 
+-  // Use isPressed() — persistent debounced state.  With one-shot scanning
+-  // (radio quiet during navigation), InputManager debounce works reliably.
++  // Use isPressed() — persistent state, edge-detected below with the
++  // *Last snapshots. On PaperS3 these come from touch zones/swipes/footer
++  // taps (see HalGPIO), not physical buttons, but the edge-detection
++  // pattern is unchanged.
+   bool btnUp      = gpio.isPressed(HalGPIO::BTN_UP);
+   bool btnDown    = gpio.isPressed(HalGPIO::BTN_DOWN);
+   bool btnLeft    = gpio.isPressed(HalGPIO::BTN_LEFT);
+@@ -307,43 +320,44 @@ static void processPhysicalButtons() {
+   bool btnConfirm = gpio.isPressed(HalGPIO::BTN_CONFIRM);
+   bool btnBack    = gpio.isPressed(HalGPIO::BTN_BACK);
+ 
+-  // Power button state machine for proper long/short press handling
+-  static bool powerHeld = false;
+-  static unsigned long powerPressStart = 0;
++  // Header zone substitutes for the physical power button (PaperS3's power
++  // button cuts power directly in hardware — it isn't software-readable).
++  // Home is a dedicated zone, so a plain tap is enough (no short/long-press
++  // ambiguity to resolve, unlike the shared physical power button on X4).
++  bool btnHome = gpio.wasPressed(HalGPIO::BTN_HOME);
++  if (btnHome && currentState != UIState::MAIN_MENU) {
++    if (currentState == UIState::TEXT_EDITOR && editorHasUnsavedChanges()) {
++      saveCurrentFile();
++    }
++    currentState = UIState::MAIN_MENU;
++    screenDirty = true;
++  }
++
++  // Sleep is a hold on its own header zone (not a shared button), but we
++  // still require a 3s hold — same threshold as the old power long-press —
++  // so a quick mis-tap on the header's edge doesn't put the device to sleep.
++  static bool sleepHeld = false;
++  static unsigned long sleepPressStart = 0;
+   static bool sleepTriggered = false;
+ 
+-  bool btnPower = gpio.isPressed(HalGPIO::BTN_POWER);
++  bool btnSleep = gpio.isPressed(HalGPIO::BTN_SLEEP);
+ 
+-  if (btnPower && !powerHeld) {
+-    // Button just pressed
+-    powerHeld = true;
++  if (btnSleep && !sleepHeld) {
++    sleepHeld = true;
+     sleepTriggered = false;
+-    powerPressStart = millis();
++    sleepPressStart = millis();
+   }
+ 
+-  if (btnPower && powerHeld && !sleepTriggered) {
+-    if (millis() - powerPressStart > 3000) {
++  if (btnSleep && sleepHeld && !sleepTriggered) {
++    if (millis() - sleepPressStart > 3000) {
+       sleepTriggered = true;
+       enterDeepSleep(SleepReason::POWER_LONGPRESS);
+-      return; // Exit early to prevent further processing
++      return;  // Exit early to prevent further processing
+     }
+   }
+ 
+-  if (!btnPower && powerHeld) {
+-    // Button released
+-    unsigned long duration = millis() - powerPressStart;
+-    powerHeld = false;
+-
+-    if (!sleepTriggered && duration > 50 && duration < 1000) {
+-      // Short press - go to main menu (except when already there)
+-      if (currentState != UIState::MAIN_MENU) {
+-        if (currentState == UIState::TEXT_EDITOR && editorHasUnsavedChanges()) {
+-          saveCurrentFile();
+-        }
+-        currentState = UIState::MAIN_MENU;
+-        screenDirty = true;
+-      }
+-    }
++  if (!btnSleep && sleepHeld) {
++    sleepHeld = false;
+   }
+ 
+   // Back button long-press for restart
+@@ -376,11 +390,11 @@ static void processPhysicalButtons() {
+   // Map physical buttons to HID key codes based on current UI state
+   switch (currentState) {
+     case UIState::MAIN_MENU:
+-      if ((btnUp && !btnUpLast) || (btnRight && !btnRightLast)) {
++      if (btnUp && !btnUpLast) {
+         enqueueKeyEvent(HID_KEY_UP, 0, true);
+         enqueueKeyEvent(HID_KEY_UP, 0, false);
+       }
+-      if ((btnDown && !btnDownLast) || (btnLeft && !btnLeftLast)) {
++      if (btnDown && !btnDownLast) {
+         enqueueKeyEvent(HID_KEY_DOWN, 0, true);
+         enqueueKeyEvent(HID_KEY_DOWN, 0, false);
+       }
+@@ -391,11 +405,11 @@ static void processPhysicalButtons() {
+       break;
+ 
+     case UIState::FILE_BROWSER:
+-      if (((btnUp && !btnUpLast) || (btnRight && !btnRightLast)) && getFileCount() > 0) {
++      if ((btnUp && !btnUpLast) && getFileCount() > 0) {
+         enqueueKeyEvent(HID_KEY_UP, 0, true);
+         enqueueKeyEvent(HID_KEY_UP, 0, false);
+       }
+-      if (((btnDown && !btnDownLast) || (btnLeft && !btnLeftLast)) && getFileCount() > 0) {
++      if ((btnDown && !btnDownLast) && getFileCount() > 0) {
+         enqueueKeyEvent(HID_KEY_DOWN, 0, true);
+         enqueueKeyEvent(HID_KEY_DOWN, 0, false);
+       }
+@@ -468,19 +482,25 @@ static void processPhysicalButtons() {
+       break;
+ 
+     case UIState::BLUETOOTH_SETTINGS:
+-      if (btnUp && !btnUpLast) {
+-        enqueueKeyEvent(HID_KEY_UP, 0, true);
++      // This screen repurposes the footer's Up/Down zones for Scan/Disconnect
++      // (see drawBluetoothSettings), so list navigation moves to the
++      // horizontal swipe (Left/Right) instead of Up/Down. The HID key codes
++      // sent are unchanged — only which physical gesture triggers which
++      // action is swapped, so syncHandleKey()/inputHandleKey() need no
++      // changes.
++      if (btnLeft && !btnLeftLast) {
++        enqueueKeyEvent(HID_KEY_UP, 0, true);     // previous device
+         enqueueKeyEvent(HID_KEY_UP, 0, false);
+       }
+-      if (btnDown && !btnDownLast) {
+-        enqueueKeyEvent(HID_KEY_DOWN, 0, true);
++      if (btnRight && !btnRightLast) {
++        enqueueKeyEvent(HID_KEY_DOWN, 0, true);   // next device
+         enqueueKeyEvent(HID_KEY_DOWN, 0, false);
+       }
+-      if (btnRight && !btnRightLast) {
++      if (btnUp && !btnUpLast) {
+         enqueueKeyEvent(HID_KEY_RIGHT, 0, true);  // Scan
+         enqueueKeyEvent(HID_KEY_RIGHT, 0, false);
+       }
+-      if (btnLeft && !btnLeftLast) {
++      if (btnDown && !btnDownLast) {
+         enqueueKeyEvent(HID_KEY_LEFT, 0, true);   // Disconnect
+         enqueueKeyEvent(HID_KEY_LEFT, 0, false);
+       }
+@@ -495,11 +515,11 @@ static void processPhysicalButtons() {
+       break;
+ 
+     case UIState::PAIRED_KEYBOARDS:
+-      if ((btnUp && !btnUpLast) || (btnRight && !btnRightLast)) {
++      if (btnUp && !btnUpLast) {
+         enqueueKeyEvent(HID_KEY_UP, 0, true);
+         enqueueKeyEvent(HID_KEY_UP, 0, false);
+       }
+-      if ((btnDown && !btnDownLast) || (btnLeft && !btnLeftLast)) {
++      if (btnDown && !btnDownLast) {
+         enqueueKeyEvent(HID_KEY_DOWN, 0, true);
+         enqueueKeyEvent(HID_KEY_DOWN, 0, false);
+       }
+@@ -514,11 +534,11 @@ static void processPhysicalButtons() {
+       break;
+ 
+     case UIState::WIFI_SYNC:
+-      if ((btnUp && !btnUpLast) || (btnRight && !btnRightLast)) {
++      if (btnUp && !btnUpLast) {
+         enqueueKeyEvent(HID_KEY_UP, 0, true);
+         enqueueKeyEvent(HID_KEY_UP, 0, false);
+       }
+-      if ((btnDown && !btnDownLast) || (btnLeft && !btnLeftLast)) {
++      if (btnDown && !btnDownLast) {
+         enqueueKeyEvent(HID_KEY_DOWN, 0, true);
+         enqueueKeyEvent(HID_KEY_DOWN, 0, false);
+       }
+@@ -533,11 +553,11 @@ static void processPhysicalButtons() {
+       break;
+ 
+     case UIState::SETTINGS:
+-      if ((btnUp && !btnUpLast) || (btnRight && !btnRightLast)) {
++      if (btnUp && !btnUpLast) {
+         enqueueKeyEvent(HID_KEY_UP, 0, true);
+         enqueueKeyEvent(HID_KEY_UP, 0, false);
+       }
+-      if ((btnDown && !btnDownLast) || (btnLeft && !btnLeftLast)) {
++      if (btnDown && !btnDownLast) {
+         enqueueKeyEvent(HID_KEY_DOWN, 0, true);
+         enqueueKeyEvent(HID_KEY_DOWN, 0, false);
+       }
+diff --git a/src/text_editor.cpp b/src/text_editor.cpp
+index 7e024f7..6405c94 100644
+--- a/src/text_editor.cpp
++++ b/src/text_editor.cpp
+@@ -169,14 +169,56 @@ void editorInsertChar(char c) {
+   ensureCursorVisible(storedVisibleLines);
+ }
+ 
++// Insert a UTF-8 encoded string (one or more bytes) at the cursor position.
++// Each byte is inserted individually so the existing single-char shift logic
++// is reused; the renderer already iterates codepoints via utf8NextCodepoint.
++void editorInsertUtf8(const char* utf8str) {
++  if (!utf8str) return;
++  for (const char* p = utf8str; *p != '\0'; p++) {
++    editorInsertChar(*p);
++  }
++}
++
++// UTF-8 helpers for deletion
++// Returns the number of bytes of the codepoint that *ends* at position `pos-1`.
++//
++// FIX: a versão original testava textBuffer[pos - len - 1], pulando o byte
++// imediatamente anterior e nunca detectando bytes de continuação (10xxxxxx).
++// A correção testa textBuffer[pos - len], recuando corretamente sobre todos
++// os bytes de continuação antes de parar no lead byte.
++static int utf8BackLen(int pos) {
++  if (pos <= 0) return 0;
++  int len = 1;
++  // Recua sobre bytes de continuação (10xxxxxx = 0x80..0xBF)
++  while (len < 4 && (pos - len) > 0 &&
++         (static_cast<unsigned char>(textBuffer[pos - len]) & 0xC0) == 0x80) {
++    len++;
++  }
++  return len;
++}
++
++// Returns the number of bytes of the codepoint that *starts* at position `pos`.
++static int utf8FwdLen(int pos) {
++  if (pos >= (int)textLength) return 0;
++  unsigned char c = static_cast<unsigned char>(textBuffer[pos]);
++  if (c < 0x80) return 1;
++  if ((c >> 5) == 0x6) return 2;
++  if ((c >> 4) == 0xE) return 3;
++  if ((c >> 3) == 0x1E) return 4;
++  return 1;  // fallback for stray continuation byte
++}
++
+ void editorDeleteChar() {
+   if (cursorPosition <= 0 || textLength == 0) return;
+ 
+-  for (int i = cursorPosition - 1; i < (int)textLength - 1; i++) {
+-    textBuffer[i] = textBuffer[i + 1];
++  int len = utf8BackLen(cursorPosition);  // bytes to remove (1–4)
++  int newPos = cursorPosition - len;
++
++  for (int i = newPos; i < (int)textLength - len; i++) {
++    textBuffer[i] = textBuffer[i + len];
+   }
+-  cursorPosition--;
+-  textLength--;
++  cursorPosition = newPos;
++  textLength -= len;
+   textBuffer[textLength] = '\0';
+   unsavedChanges = true;
+   lineBreaksDirty = true;
+@@ -188,10 +230,12 @@ void editorDeleteChar() {
+ void editorDeleteForward() {
+   if (cursorPosition >= (int)textLength) return;
+ 
+-  for (int i = cursorPosition; i < (int)textLength - 1; i++) {
+-    textBuffer[i] = textBuffer[i + 1];
++  int len = utf8FwdLen(cursorPosition);  // bytes to remove (1–4)
++
++  for (int i = cursorPosition; i < (int)textLength - len; i++) {
++    textBuffer[i] = textBuffer[i + len];
+   }
+-  textLength--;
++  textLength -= len;
+   textBuffer[textLength] = '\0';
+   unsavedChanges = true;
+   lineBreaksDirty = true;
+@@ -202,7 +246,8 @@ void editorDeleteForward() {
+ 
+ void editorMoveCursorLeft() {
+   if (cursorPosition > 0) {
+-    cursorPosition--;
++    int len = utf8BackLen(cursorPosition);
++    cursorPosition -= len;
+     editorRecalculateLines();
+     ensureCursorVisible(storedVisibleLines);
+   }
+@@ -210,7 +255,8 @@ void editorMoveCursorLeft() {
+ 
+ void editorMoveCursorRight() {
+   if (cursorPosition < (int)textLength) {
+-    cursorPosition++;
++    int len = utf8FwdLen(cursorPosition);
++    cursorPosition += len;
+     editorRecalculateLines();
+     ensureCursorVisible(storedVisibleLines);
+   }
+diff --git a/src/text_editor.h b/src/text_editor.h
+index c74d5dc..d3b7276 100644
+--- a/src/text_editor.h
++++ b/src/text_editor.h
+@@ -13,6 +13,7 @@ int editorGetCursorPosition();
+ 
+ // Editing operations
+ void editorInsertChar(char c);
++void editorInsertUtf8(const char* utf8str);  // Insert a UTF-8 string byte by byte
+ void editorDeleteChar();     // Backspace
+ void editorDeleteForward();  // Delete key
+ 
+diff --git a/src/ui_renderer.cpp b/src/ui_renderer.cpp
+index 62bb28c..8594b8c 100644
+--- a/src/ui_renderer.cpp
++++ b/src/ui_renderer.cpp
+@@ -164,6 +164,96 @@ static void drawBleStatus(GfxRenderer& renderer, int x, int y) {
+   drawClippedText(renderer, FONT_SMALL, x, y, status, 0, !darkMode);
+ }
+ 
++// ---------------------------------------------------------------------------
++// Permanent header/footer chrome (PaperS3 touch substitutes — see HalGPIO).
++// Reserved on every screen at a fixed height (gpio.getHeaderHeight() /
++// getFooterHeight(), set once in main.cpp setup()); screens position their
++// content between the two rather than drawing their own header row.
++//
++// Header, 4 quarters:  Home | KB + WiFi status | Battery | Sleep
++// Footer, 4 quarters:  Back | Confirm | Up | Down
++// ---------------------------------------------------------------------------
++
++// Center a label horizontally within quarter `quarterIdx` (0-3) of a
++// `barH`-tall bar starting at `barTop`, vertically centered within it.
++static void drawChromeLabel(GfxRenderer& r, int quarterIdx, int barTop, int barH, int sw,
++                            const char* label, bool tc, int lineOffset = 0) {
++  int quarterW = sw / 4;
++  int cx = quarterIdx * quarterW + quarterW / 2;
++  int tw = r.getTextAdvanceX(FONT_SMALL, label);
++  int x = cx - tw / 2;
++  if (x < quarterIdx * quarterW + 2) x = quarterIdx * quarterW + 2;
++  int y = barTop + barH / 2 - 6 + lineOffset;
++  drawClippedText(r, FONT_SMALL, x, y, label, quarterW - 4, tc);
++}
++
++static void drawChromeHeader(GfxRenderer& renderer, HalGPIO& gpio) {
++  int sw = renderer.getScreenWidth();
++  int headerH = gpio.getHeaderHeight();
++  if (headerH <= 0) return;
++  bool tc = !darkMode;
++  int quarterW = sw / 4;
++
++  for (int i = 1; i < 4; i++) {
++    clippedLine(renderer, i * quarterW, 4, i * quarterW, headerH - 4, tc);
++  }
++  clippedLine(renderer, 0, headerH, sw, headerH, tc);
++
++  // Q1: Home
++  drawChromeLabel(renderer, 0, 0, headerH, sw, "Home", tc);
++
++  // Q2: keyboard status (top line) + WiFi activity (bottom line, only while
++  // wifiSyncActive — the firmware only turns the radio on during PC sync,
++  // there is no persistent "connected to a network" state otherwise).
++  const char* kbStatus = "KB --";
++  switch (getConnectionState()) {
++    case BLEState::CONNECTED:    kbStatus = "KB OK"; break;
++    case BLEState::SCANNING:     kbStatus = "KB scan"; break;
++    case BLEState::CONNECTING:   kbStatus = "KB conn"; break;
++    case BLEState::DISCONNECTED: kbStatus = "KB --"; break;
++  }
++  drawChromeLabel(renderer, 1, 0, headerH, sw, kbStatus, tc, -10);
++  if (isWifiSyncActive()) {
++    drawChromeLabel(renderer, 1, 0, headerH, sw, "WiFi", tc, 10);
++  }
++
++  // Q3: battery percentage
++  int pct = gpio.getBatteryPercentage();
++  char battBuf[8];
++  snprintf(battBuf, sizeof(battBuf), "%d%%", pct);
++  drawChromeLabel(renderer, 2, 0, headerH, sw, battBuf, tc);
++
++  // Q4: Sleep
++  drawChromeLabel(renderer, 3, 0, headerH, sw, "Sleep", tc);
++}
++
++// q3Label/q4Label override the Up/Down labels — used by screens that
++// repurpose those two zones for a different pair of actions (e.g. the
++// Bluetooth screen uses them for Scan/Disconnect instead of list Up/Down).
++// The underlying virtual buttons produced by tapping those zones are still
++// BTN_UP/BTN_DOWN (HalGPIO has no concept of "current screen"); it's up to
++// the caller's button-handling code to interpret them accordingly.
++static void drawChromeFooter(GfxRenderer& renderer, HalGPIO& gpio,
++                             const char* q3Label = "Up", const char* q4Label = "Down") {
++  int sw = renderer.getScreenWidth();
++  int sh = renderer.getScreenHeight();
++  int footerH = gpio.getFooterHeight();
++  if (footerH <= 0) return;
++  bool tc = !darkMode;
++  int barTop = sh - footerH;
++  int quarterW = sw / 4;
++
++  clippedLine(renderer, 0, barTop, sw, barTop, tc);
++  for (int i = 1; i < 4; i++) {
++    clippedLine(renderer, i * quarterW, barTop + 4, i * quarterW, sh - 4, tc);
++  }
++
++  drawChromeLabel(renderer, 0, barTop, footerH, sw, "Back", tc);
++  drawChromeLabel(renderer, 1, barTop, footerH, sw, "Confirm", tc);
++  drawChromeLabel(renderer, 2, barTop, footerH, sw, q3Label, tc);
++  drawChromeLabel(renderer, 3, barTop, footerH, sw, q4Label, tc);
++}
++
+ // ===========================================================================
+ // Screen drawing functions
+ // ===========================================================================
+@@ -176,14 +266,25 @@ void drawMainMenu(GfxRenderer& renderer, HalGPIO& gpio) {
+ 
+   if (darkMode) clippedFillRect(renderer, 0, 0, sw, sh, true);
+ 
++  int headerH = gpio.getHeaderHeight();
++  int footerH = gpio.getFooterHeight();
++
+   // Title
+-  renderer.drawCenteredText(FONT_BODY, 30, "MicroSlate", tc, EpdFontFamily::BOLD);
++  renderer.drawCenteredText(FONT_BODY, headerH + 24, "MicroSlate", tc, EpdFontFamily::BOLD);
+ 
+   // Menu items (base + dynamically detected OTA apps)
+   static const char* baseMenuItems[] = {"Browse Files", "New Note", "Settings", "Sync"};
+   int menuCount = 4 + otaAppCount;
+-  for (int i = 0; i < menuCount; i++) {
+-    int yPos = 90 + (i * 45);
++  int listTop = headerH + 70;
++  int lineH = 45;
++  int maxVisible = (sh - footerH - listTop) / lineH;
++  if (maxVisible < 1) maxVisible = 1;
++  int startIdx = 0;
++  if (menuCount > maxVisible && mainMenuSelection >= maxVisible) {
++    startIdx = mainMenuSelection - maxVisible + 1;
++  }
++  for (int i = startIdx; i < menuCount && (i - startIdx) < maxVisible; i++) {
++    int yPos = listTop + ((i - startIdx) * lineH);
+     const char* label = (i < 4) ? baseMenuItems[i] : otaApps[i - 4].name;
+     if (i == mainMenuSelection) {
+       clippedFillRect(renderer, 5, yPos - 5, sw - 10, 35, tc);
+@@ -193,14 +294,8 @@ void drawMainMenu(GfxRenderer& renderer, HalGPIO& gpio) {
+     }
+   }
+ 
+-  // Footer
+-  constexpr int bm = 60;
+-  if (sh > bm + 40) {
+-    clippedLine(renderer, 10, sh - bm, sw - 10, sh - bm, tc);
+-    drawClippedText(renderer, FONT_SMALL, 20, sh - bm + 12, "Arrows: Navigate  Enter: Select", 0, tc);
+-    drawBleStatus(renderer, 20, sh - bm + 28);
+-  }
+-  drawBattery(renderer, gpio);
++  drawChromeHeader(renderer, gpio);
++  drawChromeFooter(renderer, gpio);
+ 
+   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
+ }
+@@ -213,16 +308,19 @@ void drawFileBrowser(GfxRenderer& renderer, HalGPIO& gpio) {
+ 
+   if (darkMode) clippedFillRect(renderer, 0, 0, sw, sh, true);
+ 
+-  // Header
+-  drawClippedText(renderer, FONT_SMALL, 10, 5, "Notes", 0, tc, EpdFontFamily::BOLD);
+-  drawBattery(renderer, gpio);
+-  clippedLine(renderer, 5, 32, sw - 5, 32, tc);
++  int headerH = gpio.getHeaderHeight();
++  int footerH = gpio.getFooterHeight();
++
++  // Title
++  drawClippedText(renderer, FONT_SMALL, 10, headerH + 8, "Notes", 0, tc, EpdFontFamily::BOLD);
++  clippedLine(renderer, 5, headerH + 30, sw - 5, headerH + 30, tc);
+ 
+   int fc = getFileCount();
+   int lineH = 30;
+-  int listTop = 42;
+-  int footerH = 28;  // one line of FONT_SMALL with safe bottom margin
+-  int maxVisible = (sh - listTop - footerH) / lineH;
++  int listTop = headerH + 40;
++  int statusH = 22;  // reserved for the delete-confirm / hint line just above the footer
++  int maxVisible = (sh - footerH - statusH - listTop) / lineH;
++  if (maxVisible < 1) maxVisible = 1;
+   int startIdx = 0;
+   if (fc > maxVisible && selectedFileIndex >= maxVisible) {
+     startIdx = selectedFileIndex - maxVisible + 1;
+@@ -245,15 +343,18 @@ void drawFileBrowser(GfxRenderer& renderer, HalGPIO& gpio) {
+     }
+   }
+ 
+-  // Footer
+-  clippedLine(renderer, 5, sh - footerH - 2, sw - 5, sh - footerH - 2, tc);
++  // Status line just above the footer chrome (keyboard shortcuts still work
++  // even though the footer's own Back/Confirm are for touch navigation).
++  int statusY = sh - footerH - statusH + 4;
+   if (deleteConfirmPending && fc > 0) {
+-    drawClippedText(renderer, FONT_SMALL, 10, sh - footerH + 4, "Delete? Enter:Yes  Esc:No", 0, tc);
++    drawClippedText(renderer, FONT_SMALL, 10, statusY, "Delete? Enter:Yes  Esc:No", 0, tc);
+   } else {
+-    drawClippedText(renderer, FONT_SMALL, 10, sh - footerH + 4,
+-                    "Ctrl+N:Title  Ctrl+D:Delete", 0, tc);
++    drawClippedText(renderer, FONT_SMALL, 10, statusY, "Ctrl+N:Title  Ctrl+D:Delete", 0, tc);
+   }
+ 
++  drawChromeHeader(renderer, gpio);
++  drawChromeFooter(renderer, gpio);
++
+   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
+ }
+ 
+@@ -314,7 +415,11 @@ static const char* getModeIndicator() {
+ // centerText is optional text drawn centered in the header (e.g. "Page 1/3")
+ static int drawEditorHeader(GfxRenderer& renderer, HalGPIO& gpio, int sw, bool tc,
+                             const char* centerText = nullptr) {
+-  if (cleanMode) return 8;
++  if (cleanMode) return 8;  // distraction-free: no chrome, no title row
++
++  drawChromeHeader(renderer, gpio);
++  int headerH = gpio.getHeaderHeight();
++  int rowY = headerH + 8;
+ 
+   const char* title = editorGetCurrentTitle();
+   char headerBuf[64];
+@@ -324,11 +429,11 @@ static int drawEditorHeader(GfxRenderer& renderer, HalGPIO& gpio, int sw, bool t
+     strncpy(headerBuf, title, sizeof(headerBuf) - 1);
+     headerBuf[sizeof(headerBuf) - 1] = '\0';
+   }
+-  // Mode indicator — fixed position, right-anchored before battery
++  // Mode indicator — fixed position, right-anchored
+   const char* modeInd = getModeIndicator();
+   int modeW = renderer.getTextAdvanceX(FONT_SMALL, modeInd);
+-  int modeX = sw - 70 - modeW;
+-  drawClippedText(renderer, FONT_SMALL, modeX, 5, modeInd, modeW + 5, tc);
++  int modeX = sw - 15 - modeW;
++  drawClippedText(renderer, FONT_SMALL, modeX, rowY, modeInd, modeW + 5, tc);
+ 
+   // Word count — drawn to the left of the mode indicator
+   int titleMaxW = modeX - 10;
+@@ -340,23 +445,22 @@ static int drawEditorHeader(GfxRenderer& renderer, HalGPIO& gpio, int sw, bool t
+     int wcW = renderer.getTextAdvanceX(FONT_SMALL, wcBuf);
+     int wcX = modeX - 8 - wcW;
+     if (wcX > 10) {
+-      drawClippedText(renderer, FONT_SMALL, wcX, 5, wcBuf, wcW + 5, tc);
++      drawClippedText(renderer, FONT_SMALL, wcX, rowY, wcBuf, wcW + 5, tc);
+       titleMaxW = wcX - 10;
+     }
+   }
+ 
+   // Title — stops before word count (or mode indicator if word count hidden)
+-  drawClippedText(renderer, FONT_SMALL, 10, 5, headerBuf, titleMaxW, tc, EpdFontFamily::BOLD);
++  drawClippedText(renderer, FONT_SMALL, 10, rowY, headerBuf, titleMaxW, tc, EpdFontFamily::BOLD);
+ 
+   // Centered text (e.g. page indicator)
+   if (centerText) {
+     int ctW = renderer.getTextAdvanceX(FONT_SMALL, centerText);
+-    drawClippedText(renderer, FONT_SMALL, (sw - ctW) / 2, 5, centerText, ctW + 5, tc);
++    drawClippedText(renderer, FONT_SMALL, (sw - ctW) / 2, rowY, centerText, ctW + 5, tc);
+   }
+ 
+-  drawBattery(renderer, gpio);
+-  clippedLine(renderer, 5, 32, sw - 5, 32, tc);
+-  return 38;
++  clippedLine(renderer, 5, rowY + 22, sw - 5, rowY + 22, tc);
++  return rowY + 28;
+ }
+ 
+ void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
+@@ -374,11 +478,12 @@ void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
+ 
+   // --- TYPEWRITER MODE ---
+   if (writingMode == WritingMode::TYPEWRITER) {
+-    // In clean mode (Ctrl+Z): just text on blank screen, no header
++    // In clean mode (Ctrl+Z): just text on blank screen, no chrome at all
+     int textAreaTop = cleanMode ? 0 : drawEditorHeader(renderer, gpio, sw, tc);
++    int textAreaBottom = cleanMode ? sh : sh - gpio.getFooterHeight();
+ 
+     // Center the current line vertically
+-    int textAreaHeight = sh - textAreaTop;
++    int textAreaHeight = textAreaBottom - textAreaTop;
+     int centerY = textAreaTop + (textAreaHeight / 2) - (lineHeight / 2);
+ 
+     // Draw only the current line
+@@ -391,16 +496,18 @@ void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
+ 
+     editorSetVisibleLines(1);
+ 
++    if (!cleanMode) drawChromeFooter(renderer, gpio);
++
+     renderer.beginRefresh(HalDisplay::FAST_REFRESH);
+     return;
+   }
+ 
+   // --- PAGINATION MODE ---
+   if (writingMode == WritingMode::PAGINATION) {
+-    // Pre-compute page info for the header
+-    // Use a temporary linesPerPage estimate (will be exact since header height is fixed)
+-    int tempTextTop = cleanMode ? 8 : 38;
+-    int tempLinesPerPage = (sh - 5 - tempTextTop) / lineHeight;
++    // Pre-compute page info for the header/footer (exact since both are fixed height)
++    int tempTextTop = cleanMode ? 8 : gpio.getHeaderHeight() + 36;
++    int tempTextBottom = cleanMode ? sh - 5 : sh - gpio.getFooterHeight();
++    int tempLinesPerPage = (tempTextBottom - tempTextTop) / lineHeight;
+     if (tempLinesPerPage < 1) tempLinesPerPage = 1;
+     int currentPage = curLine / tempLinesPerPage;
+     int totalPages = (totalLines + tempLinesPerPage - 1) / tempLinesPerPage;
+@@ -410,7 +517,7 @@ void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
+     snprintf(pageStr, sizeof(pageStr), "Pg %d/%d", currentPage + 1, totalPages);
+     int textAreaTop = drawEditorHeader(renderer, gpio, sw, tc, pageStr);
+ 
+-    int textAreaBottom = sh - 5;
++    int textAreaBottom = cleanMode ? sh - 5 : sh - gpio.getFooterHeight();
+     int textAreaHeight = textAreaBottom - textAreaTop;
+     int linesPerPage = textAreaHeight / lineHeight;
+     if (linesPerPage < 1) linesPerPage = 1;
+@@ -433,6 +540,8 @@ void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
+       drawEditorCursor(renderer, cursorY, lineHeight, sw, tc);
+     }
+ 
++    if (!cleanMode) drawChromeFooter(renderer, gpio);
++
+     renderer.beginRefresh(HalDisplay::FAST_REFRESH);
+     return;
+   }
+@@ -440,7 +549,7 @@ void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
+   // --- NORMAL MODE ---
+   int textAreaTop = drawEditorHeader(renderer, gpio, sw, tc);
+ 
+-  int textAreaBottom = sh - 5;
++  int textAreaBottom = cleanMode ? sh - 5 : sh - gpio.getFooterHeight();
+   int textAreaHeight = textAreaBottom - textAreaTop;
+   int visibleLines = textAreaHeight / lineHeight;
+ 
+@@ -462,6 +571,8 @@ void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
+     drawEditorCursor(renderer, cursorY, lineHeight, sw, tc);
+   }
+ 
++  if (!cleanMode) drawChromeFooter(renderer, gpio);
++
+   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
+ }
+ 
+@@ -473,12 +584,13 @@ void drawRenameScreen(GfxRenderer& renderer, HalGPIO& gpio) {
+ 
+   if (darkMode) clippedFillRect(renderer, 0, 0, sw, sh, true);
+ 
+-  drawClippedText(renderer, FONT_SMALL, 10, 5, "Edit Title", 0, tc, EpdFontFamily::BOLD);
+-  drawBattery(renderer, gpio);
+-  clippedLine(renderer, 5, 32, sw - 5, 32, tc);
++  int headerH = gpio.getHeaderHeight();
++
++  drawClippedText(renderer, FONT_SMALL, 10, headerH + 8, "Edit Title", 0, tc, EpdFontFamily::BOLD);
++  clippedLine(renderer, 5, headerH + 30, sw - 5, headerH + 30, tc);
+ 
+-  drawClippedText(renderer, FONT_SMALL, 20, 42, "Note title:", 0, tc);
+-  int boxY = 64, boxH = 36;
++  drawClippedText(renderer, FONT_SMALL, 20, headerH + 40, "Note title:", 0, tc);
++  int boxY = headerH + 62, boxH = 36;
+   int textY = boxY + 8;
+   renderer.drawRect(15, boxY, sw - 30, boxH, tc);
+   drawClippedText(renderer, FONT_UI, 20, textY, renameBuffer, sw - 50, tc);
+@@ -488,9 +600,8 @@ void drawRenameScreen(GfxRenderer& renderer, HalGPIO& gpio) {
+   if (cursorX + 2 < sw - 15)
+     renderer.fillRect(cursorX, textY, 2, 16, tc);
+ 
+-  // Footer
+-  clippedLine(renderer, 5, sh - 36, sw - 5, sh - 36, tc);
+-  drawClippedText(renderer, FONT_SMALL, 10, sh - 30, "Enter: Confirm   Esc: Cancel", 0, tc);
++  drawChromeHeader(renderer, gpio);
++  drawChromeFooter(renderer, gpio);
+ 
+   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
+ }
+@@ -499,12 +610,15 @@ void drawSettingsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
+   renderer.clearScreen();
+   int sw = renderer.getScreenWidth();
+   int sh = renderer.getScreenHeight();
++  bool tc = !darkMode;
+ 
+   if (darkMode) clippedFillRect(renderer, 0, 0, sw, sh, true);
+ 
+-  drawClippedText(renderer, FONT_SMALL, 10, 5, "Settings", 0, !darkMode, EpdFontFamily::BOLD);
+-  drawBattery(renderer, gpio);
+-  clippedLine(renderer, 5, 32, sw - 5, 32, !darkMode);
++  int headerH = gpio.getHeaderHeight();
++  int footerH = gpio.getFooterHeight();
++
++  drawClippedText(renderer, FONT_SMALL, 10, headerH + 8, "Settings", 0, tc, EpdFontFamily::BOLD);
++  clippedLine(renderer, 5, headerH + 30, sw - 5, headerH + 30, tc);
+ 
+   // Setting items: Orientation, Dark Mode, Writing Mode, Font Size, Bluetooth, Paired Keyboards
+   static const char* labels[] = {
+@@ -514,9 +628,10 @@ void drawSettingsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
+ 
+   // Compute line height to fit all items — use smaller spacing if needed
+   int lineH = 38;
+-  int listTop = 50;
+-  if (listTop + SETTINGS_COUNT * lineH > sh - 70) {
+-    lineH = (sh - 70 - listTop) / SETTINGS_COUNT;
++  int listTop = headerH + 46;
++  int listBottom = sh - footerH;
++  if (listTop + SETTINGS_COUNT * lineH > listBottom) {
++    lineH = (listBottom - listTop) / SETTINGS_COUNT;
+     if (lineH < 24) lineH = 24;
+   }
+ 
+@@ -525,10 +640,10 @@ void drawSettingsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
+     bool sel = (i == settingsSelection);
+ 
+     if (sel) {
+-      clippedFillRect(renderer, 5, yPos - 5, sw - 10, lineH - 6, !darkMode);
++      clippedFillRect(renderer, 5, yPos - 5, sw - 10, lineH - 6, tc);
+       drawClippedText(renderer, FONT_UI, 15, yPos, labels[i], sw / 2 - 15, darkMode);
+     } else {
+-      drawClippedText(renderer, FONT_UI, 15, yPos, labels[i], sw / 2 - 15, !darkMode);
++      drawClippedText(renderer, FONT_UI, 15, yPos, labels[i], sw / 2 - 15, tc);
+     }
+ 
+     // Value on the right
+@@ -562,17 +677,12 @@ void drawSettingsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
+     }
+ 
+     if (val[0] != '\0') {
+-      drawRightText(renderer, FONT_UI, sw - 20, yPos, val, sel ? darkMode : !darkMode);
++      drawRightText(renderer, FONT_UI, sw - 20, yPos, val, sel ? darkMode : tc);
+     }
+   }
+ 
+-  // Footer
+-  constexpr int bm = 60;
+-  if (sh > bm + 30) {
+-    clippedLine(renderer, 10, sh - bm, sw - 10, sh - bm, !darkMode);
+-    drawClippedText(renderer, FONT_SMALL, 20, sh - bm + 12,
+-                    "Arrows:Navigate  Enter:Change  Esc:Back", 0, !darkMode);
+-  }
++  drawChromeHeader(renderer, gpio);
++  drawChromeFooter(renderer, gpio);
+ 
+   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
+ }
+@@ -586,10 +696,14 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
+ 
+   if (darkMode) clippedFillRect(renderer, 0, 0, sw, sh, true);
+ 
+-  // Header
+-  drawClippedText(renderer, FONT_SMALL, 10, 5, "Bluetooth Devices", 0, tc, EpdFontFamily::BOLD);
+-  drawBattery(renderer, gpio);
+-  clippedLine(renderer, 5, 32, sw - 5, 32, tc);
++  int headerH = gpio.getHeaderHeight();
++  int footerH = gpio.getFooterHeight();
++  int y0 = headerH + 8;  // top of content, right under the chrome header
++
++  drawClippedText(renderer, FONT_SMALL, 10, y0, "Bluetooth Devices", 0, tc, EpdFontFamily::BOLD);
++  clippedLine(renderer, 5, headerH + 30, sw - 5, headerH + 30, tc);
++
++  int contentTop = headerH + 40;
+ 
+   // Connection status
+   const char* status = "";
+@@ -599,25 +713,28 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
+     case BLEState::CONNECTING:   status = "Connecting..."; break;
+     case BLEState::DISCONNECTED: status = "Not connected"; break;
+   }
+-  drawClippedText(renderer, FONT_SMALL, 10, 45, status, sw / 2 - 10, tc);
++  drawClippedText(renderer, FONT_SMALL, 10, contentTop, status, sw / 2 - 10, tc);
+ 
+   // Paired device info
+   std::string storedAddr, storedName;
+   if (getStoredDevice(storedAddr, storedName)) {
+     char pairedStr[64];
+     snprintf(pairedStr, sizeof(pairedStr), "Paired: %s", storedName.c_str());
+-    drawClippedText(renderer, FONT_SMALL, sw / 2, 45, pairedStr, sw / 2 - 10, tc);
++    drawClippedText(renderer, FONT_SMALL, sw / 2, contentTop, pairedStr, sw / 2 - 10, tc);
+   }
+ 
++  int listHeaderY = contentTop + 25;
++  int listTop = contentTop + 45;
++
+   // Passkey display
+   uint32_t passkey = getCurrentPasskey();
+   if (passkey > 0) {
+     char passkeyStr[32];
+-    drawClippedText(renderer, FONT_UI, 20, 100, "PAIRING CODE:", 0, tc, EpdFontFamily::BOLD);
++    drawClippedText(renderer, FONT_UI, 20, listTop + 15, "PAIRING CODE:", 0, tc, EpdFontFamily::BOLD);
+     snprintf(passkeyStr, sizeof(passkeyStr), "%06lu", passkey);
+-    drawClippedText(renderer, FONT_BODY, 20, 130, passkeyStr, 0, tc, EpdFontFamily::BOLD);
+-    drawClippedText(renderer, FONT_SMALL, 20, 160, "Type this code on your keyboard", 0, tc);
+-    drawClippedText(renderer, FONT_SMALL, 20, 180, "then press Enter", 0, tc);
++    drawClippedText(renderer, FONT_BODY, 20, listTop + 45, passkeyStr, 0, tc, EpdFontFamily::BOLD);
++    drawClippedText(renderer, FONT_SMALL, 20, listTop + 75, "Type this code on your keyboard", 0, tc);
++    drawClippedText(renderer, FONT_SMALL, 20, listTop + 95, "then press Enter", 0, tc);
+   } else if (isDeviceScanning()) {
+     static uint8_t dotPhase = 0;
+     static uint32_t lastAnimMs = 0;
+@@ -629,21 +746,22 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
+     char scanningStr[64];
+     int deviceCount = getDiscoveredDeviceCount();
+     snprintf(scanningStr, sizeof(scanningStr), "Searching for devices%s", dots.c_str());
+-    drawClippedText(renderer, FONT_SMALL, 10, 60, scanningStr, sw / 2 - 10, tc);
++    drawClippedText(renderer, FONT_SMALL, 10, listTop - 10, scanningStr, sw / 2 - 10, tc);
+ 
+     char foundStr[32];
+     snprintf(foundStr, sizeof(foundStr), "Found: %d", deviceCount);
+-    drawClippedText(renderer, FONT_SMALL, sw / 2, 60, foundStr, sw / 2 - 10, tc);
++    drawClippedText(renderer, FONT_SMALL, sw / 2, listTop - 10, foundStr, sw / 2 - 10, tc);
+   }
+ 
+   // Device list
+   int deviceCount = getDiscoveredDeviceCount();
++  int footerZone = footerH + 8;
+   if (deviceCount > 0) {
+     BleDeviceInfo* devices = getDiscoveredDevices();
+ 
+     char headerStr[64];
+     snprintf(headerStr, sizeof(headerStr), "Available devices: %d", deviceCount);
+-    drawClippedText(renderer, FONT_SMALL, 10, 70, headerStr, 0, tc, EpdFontFamily::BOLD);
++    drawClippedText(renderer, FONT_SMALL, 10, listHeaderY, headerStr, 0, tc, EpdFontFamily::BOLD);
+ 
+     // Show up to 10 devices (pagination via scrolling)
+     int maxDevicesToShow = 10;
+@@ -656,10 +774,10 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
+ 
+     for (int i = 0; i < devicesToShow; i++) {
+       int deviceIndex = startIndex + i;
+-      int yPos = 90 + (i * 30);
++      int yPos = listTop + (i * 30);
+ 
+       // Stop drawing if we'd go into the footer zone
+-      if (yPos > sh - 100) break;
++      if (yPos > sh - footerZone) break;
+ 
+       bool isSelected = (bluetoothDeviceSelection == deviceIndex);
+       bool isConnected = (getCurrentDeviceAddress() == devices[deviceIndex].address);
+@@ -690,22 +808,20 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
+       int pageNum = (bluetoothDeviceSelection / maxDevicesToShow) + 1;
+       int totalPages = (deviceCount + maxDevicesToShow - 1) / maxDevicesToShow;
+       snprintf(navHint, sizeof(navHint), "Page %d/%d", pageNum, totalPages);
+-      int navY = 90 + (devicesToShow * 30);
+-      if (navY < sh - 100)
++      int navY = listTop + (devicesToShow * 30);
++      if (navY < sh - footerZone)
+         drawClippedText(renderer, FONT_SMALL, 15, navY, navHint, 0, tc);
+     }
+   } else {
+-    drawClippedText(renderer, FONT_UI, 20, 80, "No devices found", 0, tc);
+-    drawClippedText(renderer, FONT_SMALL, 20, 100, "Press Enter to scan for devices", 0, tc);
++    drawClippedText(renderer, FONT_UI, 20, listTop - 10, "No devices found", 0, tc);
++    drawClippedText(renderer, FONT_SMALL, 20, listTop + 10, "Press Enter to scan for devices", 0, tc);
+   }
+ 
+-  // Footer
+-  constexpr int bm = 60;
+-  if (sh > bm + 30) {
+-    clippedLine(renderer, 10, sh - bm, sw - 10, sh - bm, tc);
+-    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 8,  "Enter:Connect  Right:Scan", 0, tc);
+-    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 22, "Left:Disconnect  Esc:Back", 0, tc);
+-  }
++  drawChromeHeader(renderer, gpio);
++  // This screen repurposes the footer's Up/Down zones for Scan/Disconnect
++  // (list navigation moves to the horizontal swipe instead — see the
++  // BLUETOOTH_SETTINGS case in main.cpp's processPhysicalButtons()).
++  drawChromeFooter(renderer, gpio, "Scan", "Disconn");
+ 
+   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
+ }
+@@ -718,24 +834,32 @@ void drawPairedKeyboardsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
+ 
+   if (darkMode) clippedFillRect(renderer, 0, 0, sw, sh, true);
+ 
+-  drawClippedText(renderer, FONT_SMALL, 10, 5, "Paired Keyboards", 0, tc, EpdFontFamily::BOLD);
+-  drawBattery(renderer, gpio);
+-  clippedLine(renderer, 5, 32, sw - 5, 32, tc);
++  int headerH = gpio.getHeaderHeight();
++  int footerH = gpio.getFooterHeight();
++
++  drawClippedText(renderer, FONT_SMALL, 10, headerH + 8, "Paired Keyboards", 0, tc, EpdFontFamily::BOLD);
++  clippedLine(renderer, 5, headerH + 30, sw - 5, headerH + 30, tc);
+ 
+   int count = getPairedKeyboardCount();
+   if (count == 0) {
+-    drawClippedText(renderer, FONT_UI, 20, 60, "No paired keyboards", 0, tc);
+-    drawClippedText(renderer, FONT_SMALL, 20, 85, "Go to Bluetooth to scan and connect", 0, tc);
++    drawClippedText(renderer, FONT_UI, 20, headerH + 60, "No paired keyboards", 0, tc);
++    drawClippedText(renderer, FONT_SMALL, 20, headerH + 85, "Go to Bluetooth to scan and connect", 0, tc);
+   } else {
+     std::string currentAddr = getCurrentDeviceAddress();
+     int lineH = 38;
+-    int listTop = 44;
++    int listTop = headerH + 44;
++    int maxVisible = (sh - footerH - listTop) / lineH;
++    if (maxVisible < 1) maxVisible = 1;
++    int startIdx = 0;
++    if (count > maxVisible && pairedKeyboardSelection >= maxVisible) {
++      startIdx = pairedKeyboardSelection - maxVisible + 1;
++    }
+ 
+-    for (int i = 0; i < count; i++) {
++    for (int i = startIdx; i < count && (i - startIdx) < maxVisible; i++) {
+       std::string addr, name; uint8_t addrType;
+       getPairedKeyboard(i, addr, name, addrType);
+ 
+-      int yPos = listTop + (i * lineH);
++      int yPos = listTop + ((i - startIdx) * lineH);
+       bool sel = (i == pairedKeyboardSelection);
+       bool active = (!currentAddr.empty() && currentAddr == addr);
+ 
+@@ -754,12 +878,8 @@ void drawPairedKeyboardsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
+     }
+   }
+ 
+-  constexpr int bm = 52;
+-  if (sh > bm + 30) {
+-    clippedLine(renderer, 10, sh - bm, sw - 10, sh - bm, tc);
+-    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 8,  "Enter:Connect  D:Forget", 0, tc);
+-    drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 22, "Left:Disconnect  Esc:Back", 0, tc);
+-  }
++  drawChromeHeader(renderer, gpio);
++  drawChromeFooter(renderer, gpio);
+ 
+   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
+ }
+@@ -787,16 +907,18 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
+ 
+   if (darkMode) clippedFillRect(renderer, 0, 0, sw, sh, true);
+ 
+-  // Header
+-  drawClippedText(renderer, FONT_SMALL, 10, 5, "Sync", 0, tc, EpdFontFamily::BOLD);
+-  drawBattery(renderer, gpio);
+-  clippedLine(renderer, 5, 32, sw - 5, 32, tc);
++  int headerH = gpio.getHeaderHeight();
++  int footerH = gpio.getFooterHeight();
++  int off = headerH - 32;  // shift every legacy (32px-header-era) y-constant below
++
++  drawClippedText(renderer, FONT_SMALL, 10, headerH + 8, "Sync", 0, tc, EpdFontFamily::BOLD);
++  clippedLine(renderer, 5, headerH + 30, sw - 5, headerH + 30, tc);
+ 
+   SyncState state = getSyncState();
+ 
+   switch (state) {
+     case SyncState::SCANNING: {
+-      drawClippedText(renderer, FONT_UI, 20, 80, "Scanning for networks...", sw - 40, tc);
++      drawClippedText(renderer, FONT_UI, 20, 80 + off, "Scanning for networks...", sw - 40, tc);
+       break;
+     }
+ 
+@@ -806,15 +928,15 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
+ 
+       if (nc == 0) {
+         const char* st = getSyncStatusText();
+-        drawClippedText(renderer, FONT_UI, 20, 60, st[0] ? st : "No networks found", sw - 40, tc);
+-        drawClippedText(renderer, FONT_SMALL, 20, 90, "Enter: Rescan  Esc: Back", 0, tc);
++        drawClippedText(renderer, FONT_UI, 20, 60 + off, st[0] ? st : "No networks found", sw - 40, tc);
++        drawClippedText(renderer, FONT_SMALL, 20, 90 + off, "Enter: Rescan  Esc: Back", 0, tc);
+       } else {
+-        drawClippedText(renderer, FONT_SMALL, 10, 38, "Select network:", 0, tc);
++        drawClippedText(renderer, FONT_SMALL, 10, 38 + off, "Select network:", 0, tc);
+ 
+         int lineH = 28;
+-        int listTop = 56;
+-        int footerH = 28;
+-        int maxVisible = (sh - listTop - footerH) / lineH;
++        int listTop = 56 + off;
++        int maxVisible = (sh - footerH - listTop) / lineH;
++        if (maxVisible < 1) maxVisible = 1;
+         int startIdx = 0;
+         if (nc > maxVisible && sel >= maxVisible) {
+           startIdx = sel - maxVisible + 1;
+@@ -840,13 +962,10 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
+             drawSignalBars(renderer, sw - 30, yPos, getNetworkRSSI(i), tc);
+           }
+         }
+-      }
+ 
+-      // Footer
+-      constexpr int bm = 28;
+-      clippedLine(renderer, 10, sh - bm - 2, sw - 10, sh - bm - 2, tc);
+-      drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 4,
+-                      "*=encrypted +=saved  Enter:Select  Esc:Back", 0, tc);
++        drawClippedText(renderer, FONT_SMALL, 10, sh - footerH - 18,
++                        "*=encrypted +=saved  Enter:Select", 0, tc);
++      }
+       break;
+     }
+ 
+@@ -854,39 +973,39 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
+       int sel = getSelectedNetwork();
+       char heading[48];
+       snprintf(heading, sizeof(heading), "Password for %s", getNetworkSSID(sel));
+-      drawClippedText(renderer, FONT_SMALL, 20, 42, heading, sw - 40, tc);
++      drawClippedText(renderer, FONT_SMALL, 20, 42 + off, heading, sw - 40, tc);
+ 
+       // Password field box
+-      renderer.drawRect(15, 62, sw - 30, 30, tc);
++      renderer.drawRect(15, 62 + off, sw - 30, 30, tc);
+ 
+       // Show dots for password characters (privacy)
+       int pLen = getPasswordLen();
+       char dots[64];
+       for (int i = 0; i < pLen; i++) dots[i] = '*';
+       dots[pLen] = '\0';
+-      drawClippedText(renderer, FONT_UI, 20, 66, dots, sw - 50, tc);
++      drawClippedText(renderer, FONT_UI, 20, 66 + off, dots, sw - 50, tc);
+ 
+       // Cursor
+       int cursorX = 20 + renderer.getTextAdvanceX(FONT_UI, dots);
+       int cursorW = renderer.getSpaceWidth(FONT_UI);
+       if (cursorW < 2) cursorW = 8;
+       if (cursorX + cursorW < sw)
+-        renderer.fillRect(cursorX, 66, cursorW, 20, tc);
++        renderer.fillRect(cursorX, 66 + off, cursorW, 20, tc);
+ 
+-      drawClippedText(renderer, FONT_SMALL, 20, 110, "Enter: Connect   Esc: Cancel", 0, tc);
++      drawClippedText(renderer, FONT_SMALL, 20, 110 + off, "Enter: Connect   Esc: Cancel", 0, tc);
+       break;
+     }
+ 
+     case SyncState::CONNECTING: {
+       const char* st = getSyncStatusText();
+-      drawClippedText(renderer, FONT_UI, 20, 80, st, sw - 40, tc);
+-      drawClippedText(renderer, FONT_SMALL, 20, 110, "Esc: Cancel", 0, tc);
++      drawClippedText(renderer, FONT_UI, 20, 80 + off, st, sw - 40, tc);
++      drawClippedText(renderer, FONT_SMALL, 20, 110 + off, "Esc: Cancel", 0, tc);
+       break;
+     }
+ 
+     case SyncState::SYNCING: {
+       const char* ip = getSyncStatusText();
+-      drawClippedText(renderer, FONT_SMALL, 20, 42, ip, sw - 40, tc, EpdFontFamily::BOLD);
++      drawClippedText(renderer, FONT_SMALL, 20, 42 + off, ip, sw - 40, tc, EpdFontFamily::BOLD);
+ 
+       int sent    = getSyncFilesSent();
+       bool pcConn = isPcConnected();
+@@ -912,10 +1031,11 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
+       }
+ 
+       // Display with auto-scroll: keep last [x] + next [-] in view
+-      constexpr int lineH   = 22;
+-      constexpr int listTop = 62;
+-      constexpr int footerH = 32;
+-      int maxVisible = (sh - listTop - footerH) / lineH;
++      constexpr int lineH = 22;
++      int listTop = 62 + off;
++      int statusLineH = 22;  // reserved just above the footer for the "Sent: N" line
++      int maxVisible = (sh - footerH - statusLineH - listTop) / lineH;
++      if (maxVisible < 1) maxVisible = 1;
+ 
+       int lastDone = 0;
+       for (int i = 0; i < numStages; i++) {
+@@ -936,46 +1056,47 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
+         drawClippedText(renderer, FONT_SMALL, 15, yPos, line, sw - 25, tc);
+       }
+ 
+-      // Footer
+-      constexpr int bm = 28;
+-      clippedLine(renderer, 10, sh - bm - 2, sw - 10, sh - bm - 2, tc);
++      // Status line just above the footer chrome
+       char countStr[32];
+       snprintf(countStr, sizeof(countStr), "Sent: %d   Esc: Cancel", sent);
+-      drawClippedText(renderer, FONT_SMALL, 10, sh - bm + 4, countStr, sw - 20, tc);
++      drawClippedText(renderer, FONT_SMALL, 10, sh - footerH - statusLineH + 4, countStr, sw - 20, tc);
+       break;
+     }
+ 
+     case SyncState::DONE: {
+       const char* summary = getSyncStatusText();
+-      drawClippedText(renderer, FONT_SMALL, 20, 50, "Sync Complete", 0, tc, EpdFontFamily::BOLD);
+-      drawClippedText(renderer, FONT_UI, 20, 85, summary, sw - 40, tc);
+-      drawClippedText(renderer, FONT_SMALL, 20, 125, "Returning to menu...", 0, tc);
++      drawClippedText(renderer, FONT_SMALL, 20, 50 + off, "Sync Complete", 0, tc, EpdFontFamily::BOLD);
++      drawClippedText(renderer, FONT_UI, 20, 85 + off, summary, sw - 40, tc);
++      drawClippedText(renderer, FONT_SMALL, 20, 125 + off, "Returning to menu...", 0, tc);
+       break;
+     }
+ 
+     case SyncState::CONNECT_FAILED: {
+-      drawClippedText(renderer, FONT_UI, 20, 80, "Connection failed", sw - 40, tc);
+-      drawClippedText(renderer, FONT_SMALL, 20, 110, "Enter: Retry   Esc: Back", 0, tc);
++      drawClippedText(renderer, FONT_UI, 20, 80 + off, "Connection failed", sw - 40, tc);
++      drawClippedText(renderer, FONT_SMALL, 20, 110 + off, "Enter: Retry   Esc: Back", 0, tc);
+       break;
+     }
+ 
+     case SyncState::SAVE_PROMPT: {
+       const char* ip = getSyncStatusText();
+-      drawClippedText(renderer, FONT_SMALL, 20, 50, "Connected!", 0, tc, EpdFontFamily::BOLD);
+-      drawClippedText(renderer, FONT_UI, 20, 80, ip, sw - 40, tc);
+-      drawClippedText(renderer, FONT_SMALL, 20, 120, "Save password?", 0, tc, EpdFontFamily::BOLD);
+-      drawClippedText(renderer, FONT_SMALL, 20, 145, "Enter/Up: Yes   Down/Esc: No", 0, tc);
++      drawClippedText(renderer, FONT_SMALL, 20, 50 + off, "Connected!", 0, tc, EpdFontFamily::BOLD);
++      drawClippedText(renderer, FONT_UI, 20, 80 + off, ip, sw - 40, tc);
++      drawClippedText(renderer, FONT_SMALL, 20, 120 + off, "Save password?", 0, tc, EpdFontFamily::BOLD);
++      drawClippedText(renderer, FONT_SMALL, 20, 145 + off, "Enter/Up: Yes   Down/Esc: No", 0, tc);
+       break;
+     }
+ 
+     case SyncState::FORGET_PROMPT: {
+-      drawClippedText(renderer, FONT_UI, 20, 80, "Saved password failed", sw - 40, tc);
+-      drawClippedText(renderer, FONT_SMALL, 20, 120, "Forget saved password?", 0, tc, EpdFontFamily::BOLD);
+-      drawClippedText(renderer, FONT_SMALL, 20, 145, "Enter/Up: Yes   Down/Esc: No", 0, tc);
++      drawClippedText(renderer, FONT_UI, 20, 80 + off, "Saved password failed", sw - 40, tc);
++      drawClippedText(renderer, FONT_SMALL, 20, 120 + off, "Forget saved password?", 0, tc, EpdFontFamily::BOLD);
++      drawClippedText(renderer, FONT_SMALL, 20, 145 + off, "Enter/Up: Yes   Down/Esc: No", 0, tc);
+       break;
+     }
+   }
+ 
++  drawChromeHeader(renderer, gpio);
++  drawChromeFooter(renderer, gpio);
++
+   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
+ }
+ 
