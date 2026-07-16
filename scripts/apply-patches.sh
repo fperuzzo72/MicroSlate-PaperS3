@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 echo "== MicroSlate =="
-if [ ! -d firmware/microslate/.git ]; then
+if [ ! -e firmware/microslate/.git ]; then
   echo "firmware/microslate submodule not found — run scripts/setup.sh first." >&2
   exit 1
 fi
