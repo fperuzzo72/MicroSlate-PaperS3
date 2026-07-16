@@ -12,9 +12,19 @@ git submodule add https://github.com/Josh-writes/microslate-firmware.git firmwar
 git submodule add https://github.com/uxjulia/CrossInk.git firmware/crossink
 git submodule add https://gitlab.com/zephray/paperboy.git firmware/paperboy
 
-# Reference only — upstream CrossPoint's own PaperS3 touch port. Not built,
-# not part of firmware/. Kept so we can re-diff it while working out the
-# CrossInk touch port (see patches/crossink/PORTING.md).
+# Near-term launcher: CrossPoint's own, actively-maintained PaperS3 touch
+# port. Used instead of a from-scratch CrossInk port for now — see
+# docs/crosspoint-papers3-sync-plan.md for why. Pinned to its current
+# release tag (1.3.2); syncing it to upstream CrossPoint 1.4.1 is tracked
+# separately, not done as part of this setup.
+git submodule add https://github.com/juicecultus/crosspoint-reader-papers3.git firmware/crosspoint
+( cd firmware/crosspoint && git checkout v1.3.2 )
+
+# Reference only — same repo as firmware/crosspoint above, but left on its
+# default branch (latest, not pinned) so it can be diffed against
+# reference/crosspoint-reader to track the upstream-sync gap. Also the
+# source of truth when porting CrossInk's input layer later (see
+# docs/crosspoint-papers3-sync-plan.md and patches/crossink/PORTING.md).
 git submodule add https://github.com/juicecultus/crosspoint-reader-papers3.git reference/crosspoint-reader-papers3
 git submodule add https://github.com/crosspoint-reader/crosspoint-reader.git reference/crosspoint-reader
 

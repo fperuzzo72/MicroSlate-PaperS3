@@ -13,3 +13,6 @@
 [submodule "reference/crosspoint-reader"]
 	path = reference/crosspoint-reader
 	url = https://github.com/crosspoint-reader/crosspoint-reader.git
+[submodule "firmware/crosspoint"]
+	path = firmware/crosspoint
+	url = https://github.com/juicecultus/crosspoint-reader-papers3.git

@@ -1,5 +1,11 @@
 # CrossInk → PaperS3 touch port — status
 
+> **Update:** the near-term launcher is CrossPoint's own PaperS3 port
+> (`firmware/crosspoint`), not CrossInk — see
+> `docs/crosspoint-papers3-sync-plan.md`. Everything below is unchanged and
+> still the plan for when CrossInk becomes the launcher; it isn't blocking
+> anything right now.
+
 **Not done yet.** This is a plan, not a patch, because CrossInk's input layer
 has diverged too much from upstream CrossPoint to auto-apply the reference
 port cleanly. Doing it blind risks landing something that looks applied but
