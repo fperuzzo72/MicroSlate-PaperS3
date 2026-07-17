@@ -1,0 +1,56 @@
+name: Build CrossPoint (launcher)
+
+# Builds firmware/crosspoint (the CrossPoint-PaperS3 launcher submodule) via
+# PlatformIO, the same way the upstream juicecultus/crosspoint-reader-papers3
+# repo builds its own releases — same PlatformIO Core version and same
+# gh_release environment, so the output matches what upstream ships.
+#
+# Trigger manually from the Actions tab (workflow_dispatch), or push a commit
+# that bumps the firmware/crosspoint submodule pointer.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'firmware/crosspoint'
+      - '.github/workflows/build-crosspoint.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+          enable-cache: false
+
+      - name: Install PlatformIO Core
+        run: uv pip install --system -U https://github.com/pioarduino/platformio-core/archive/refs/tags/v6.1.19.zip
+
+      # gh_release includes bootloader.bin + partitions.bin alongside
+      # firmware.bin — all three are needed for a from-scratch flash (the
+      # device has no CrossPoint bootloader on it yet).
+      - name: Build CrossPoint (gh_release env)
+        working-directory: firmware/crosspoint
+        run: pio run -e gh_release
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: crosspoint-papers3-firmware
+          path: |
+            firmware/crosspoint/.pio/build/gh_release/bootloader.bin
+            firmware/crosspoint/.pio/build/gh_release/firmware.bin
+            firmware/crosspoint/.pio/build/gh_release/partitions.bin
+            firmware/crosspoint/.pio/build/gh_release/firmware.elf
+            firmware/crosspoint/.pio/build/gh_release/firmware.map
+          if-no-files-found: error
