@@ -1,0 +1,29 @@
+diff --git a/src/activities/notes/ble/ble_compat.h b/src/activities/notes/ble/ble_compat.h
+index e2bf25f..bfed478 100644
+--- a/src/activities/notes/ble/ble_compat.h
++++ b/src/activities/notes/ble/ble_compat.h
+@@ -93,3 +93,24 @@ static inline bool jsonGetStr(const char* json, const char* key, char* out, size
+   out[i] = '\0';
+   return true;
+ }
++
++// Append an escaped JSON string value (no surrounding quotes) — used by
++// writeBleBackup() to build the backup JSON by hand.
++static inline void jsonAppendStr(char* buf, size_t bufSize, const char* src) {
++  size_t pos = strlen(buf);
++  while (*src && pos < bufSize - 2) {
++    if (*src == '"' || *src == '\\') buf[pos++] = '\\';
++    buf[pos++] = *src++;
++  }
++  buf[pos] = '\0';
++}
++
++// writeBleBackup() in ble_keyboard.cpp calls SdMan.exists()/mkdir() directly
++// (MicroSlate's SDCardManager singleton) instead of going through
++// sdWriteFile()'s own directory-creation. A tiny compatibility shim so that
++// call site works unmodified against HalStorage.
++struct SdManCompat {
++  bool exists(const char* path) { return Storage.exists(path); }
++  bool mkdir(const char* path) { return Storage.ensureDirectoryExists(path); }
++};
++static SdManCompat SdMan;
