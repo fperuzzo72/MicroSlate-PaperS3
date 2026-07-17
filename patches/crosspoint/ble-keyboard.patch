@@ -1,0 +1,1898 @@
+diff --git a/platformio.ini b/platformio.ini
+index a7338a2..ba83738 100644
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -75,6 +75,11 @@ lib_deps =
+   links2004/WebSockets @ 2.7.3
+   m5stack/M5Unified @ ^0.2.5
+   m5stack/M5GFX @ ^0.2.7
++  ; BLE HID keyboard host for MicroSlate Notes. MicroSlate itself uses
++  ; esp-nimble-cpp (its build is arduino+espidf); this project is pure
++  ; arduino framework, where NimBLE-Arduino is the same library with the
++  ; same NimBLEDevice.h API, wrapped for Arduino builds.
++  h2zero/NimBLE-Arduino @ ^2.3.4
+ 
+ [env:default]
+ extends = base
+diff --git a/src/activities/notes/NoteEditorActivity.cpp b/src/activities/notes/NoteEditorActivity.cpp
+index 5f82b15..14ae2a6 100644
+--- a/src/activities/notes/NoteEditorActivity.cpp
++++ b/src/activities/notes/NoteEditorActivity.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include "components/UITheme.h"
+ #include "fontIds.h"
++#include "ble/KeyQueue.h"
++#include "ble/ble_keyboard.h"
+ 
+ namespace {
+ // Editor body font. UI_10 keeps ~40+ chars per line in portrait — close to
+@@ -47,6 +49,11 @@ void NoteEditorActivity::onEnter() {
+   const int avgCharWidth = renderer.getTextWidth(kEditorFontId, "n");
+   editor.setCharsPerLine(avgCharWidth > 0 ? usableWidth / avgCharWidth : 40);
+ 
++  // BLE keyboard: initialize (idempotent) and auto-reconnect to the last
++  // paired keyboard if one exists — same behavior as MicroSlate on boot.
++  bleSetup();
++  keyInput.reset();
++
+   requestUpdateAndWait();
+ }
+ 
+@@ -60,14 +67,25 @@ void NoteEditorActivity::onExit() {
+ }
+ 
+ void NoteEditorActivity::loop() {
++  bleLoop();  // keeps the keyboard connection/reconnect state machine running
++
+   if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+     finish();  // onExit autosaves
+     return;
+   }
+ 
+   bool changed = false;
+-  // Content-zone horizontal gestures move the cursor (keyboard arrives with
+-  // the BLE port; these stay useful afterwards for quick repositioning).
++
++  // BLE keyboard input (typing, navigation, backspace, Ctrl+S)
++  bool saveRequested = false;
++  if (keyInput.processPending(editor, saveRequested)) changed = true;
++  if (saveRequested && noteStore) {
++    noteStore->saveCurrentFile(editor);
++    changed = true;
++  }
++
++  // Content-zone horizontal gestures move the cursor (kept alongside the
++  // keyboard for quick repositioning by touch).
+   if (mappedInput.wasReleased(MappedInputManager::Button::Left)) {
+     editor.moveCursorLeft();
+     changed = true;
+@@ -145,10 +163,15 @@ void NoteEditorActivity::render(RenderLock&&) {
+ 
+     // Empty note hint
+     if (editor.length() == 0) {
+-      renderer.drawText(kEditorFontId, metrics.contentSidePadding, textTop + lineHeight * 2,
+-                        "Empty note. Text entry arrives with the");
+-      renderer.drawText(kEditorFontId, metrics.contentSidePadding, textTop + lineHeight * 3,
+-                        "BLE keyboard port (next step).");
++      if (isKeyboardConnected()) {
++        renderer.drawText(kEditorFontId, metrics.contentSidePadding, textTop + lineHeight * 2,
++                          "Empty note. Start typing.");
++      } else {
++        renderer.drawText(kEditorFontId, metrics.contentSidePadding, textTop + lineHeight * 2,
++                          "No keyboard connected. Pair one from");
++        renderer.drawText(kEditorFontId, metrics.contentSidePadding, textTop + lineHeight * 3,
++                          "the notes list (Pair keyboard).");
++      }
+     }
+   }
+ 
+diff --git a/src/activities/notes/NoteEditorActivity.h b/src/activities/notes/NoteEditorActivity.h
+index af7c5e7..058ac57 100644
+--- a/src/activities/notes/NoteEditorActivity.h
++++ b/src/activities/notes/NoteEditorActivity.h
+@@ -2,17 +2,14 @@
+ #include "../Activity.h"
+ #include "NoteEditor.h"
+ #include "NoteStore.h"
++#include "ble/NoteKeyInput.h"
+ 
+ // MicroSlate's editor screen as a CrossPoint Activity: renders the note
+-// buffer with word wrap and a visible cursor, autosaves on exit.
+-//
+-// Input today is touch-only (footer Confirm/Back + content-zone Left/Right
+-// for cursor movement). Text ENTRY requires the BLE keyboard subsystem
+-// (MicroSlate's ble_keyboard.cpp + input_handler.cpp with the
+-// US-International dead-key support) which is NOT ported yet — see the
+-// keyboard section in docs/crosspoint-papers3-sync-plan.md. The editor core
+-// (NoteEditor) already exposes insertUtf8()/deleteChar()/etc. for it to
+-// plug into, so the keyboard port is additive: nothing here changes.
++// buffer with word wrap and a visible cursor, autosaves on exit. Text entry
++// comes from the BLE keyboard subsystem (ble/ — MicroSlate's ble_keyboard
++// used unmodified, plus NoteKeyInput for HID→editor mapping with
++// US-International dead keys). Touch gestures remain for quick cursor
++// repositioning.
+ class NoteEditorActivity final : public Activity {
+  public:
+   explicit NoteEditorActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
+@@ -30,6 +27,7 @@ class NoteEditorActivity final : public Activity {
+  private:
+   NoteStore* noteStore = nullptr;
+   NoteEditor editor;
++  NoteKeyInput keyInput;
+   bool loadFailed = false;
+   char pendingFilename[NoteEditor::kMaxFilenameLen] = "";
+   bool isNew = false;
+diff --git a/src/activities/notes/NotesActivity.cpp b/src/activities/notes/NotesActivity.cpp
+index f9c233f..63d6e4c 100644
+--- a/src/activities/notes/NotesActivity.cpp
++++ b/src/activities/notes/NotesActivity.cpp
+@@ -4,9 +4,14 @@
+ 
+ #include "../ActivityManager.h"
+ #include "NoteEditorActivity.h"
++#include "ble/KeyboardPairingActivity.h"
+ #include "components/UITheme.h"
+ #include "fontIds.h"
+ 
++namespace {
++constexpr int kFixedRows = 2;  // 0 = "+ New note", 1 = "Pair keyboard"
++}
++
+ void NotesActivity::onEnter() {
+   Activity::onEnter();
+   storageOk = store.begin();
+@@ -17,23 +22,29 @@ void NotesActivity::onEnter() {
+ }
+ 
+ void NotesActivity::openSelected() {
++  if (selectorIndex == 1) {
++    startActivityForResult(std::make_unique<KeyboardPairingActivity>(renderer, mappedInput),
++                           [](const ActivityResult&) {});
++    return;
++  }
++
+   auto editorActivity = std::make_unique<NoteEditorActivity>(renderer, mappedInput);
+   if (selectorIndex == 0) {
+     editorActivity->startNew(store);
+   } else {
+-    editorActivity->startExisting(store, store.file(selectorIndex - 1).filename);
++    editorActivity->startExisting(store, store.file(selectorIndex - kFixedRows).filename);
+   }
+   // Push (not replace) so Back in the editor returns to this list with its
+   // state intact; the result handler refreshes the list since the editor may
+   // have created/renamed/saved a note.
+   startActivityForResult(std::move(editorActivity), [this](const ActivityResult&) {
+     store.refreshFileList();
+-    if (selectorIndex > store.fileCount()) selectorIndex = store.fileCount();
++    if (selectorIndex >= kFixedRows + store.fileCount()) selectorIndex = kFixedRows + store.fileCount() - 1;
+   });
+ }
+ 
+ void NotesActivity::loop() {
+-  const int itemCount = 1 + store.fileCount();  // "+ New note" + files
++  const int itemCount = kFixedRows + store.fileCount();
+ 
+   buttonNavigator.onNext([this, itemCount] {
+     selectorIndex = ButtonNavigator::nextIndex(selectorIndex, itemCount);
+@@ -55,14 +66,14 @@ void NotesActivity::loop() {
+ 
+   // Hold-to-delete pattern: PageBack (left content zone / long-press
+   // substitute) asks for confirmation, Confirm within the prompt deletes.
+-  if (selectorIndex > 0 && mappedInput.wasReleased(MappedInputManager::Button::Left)) {
++  if (selectorIndex >= kFixedRows && mappedInput.wasReleased(MappedInputManager::Button::Left)) {
+     deleteConfirmPending = !deleteConfirmPending;
+     requestUpdate();
+     return;
+   }
+   if (deleteConfirmPending && mappedInput.wasReleased(MappedInputManager::Button::Right)) {
+-    store.deleteFile(store.file(selectorIndex - 1).filename);
+-    if (selectorIndex > store.fileCount()) selectorIndex = store.fileCount();
++    store.deleteFile(store.file(selectorIndex - kFixedRows).filename);
++    if (selectorIndex >= kFixedRows + store.fileCount()) selectorIndex = kFixedRows + store.fileCount() - 1;
+     deleteConfirmPending = false;
+     requestUpdate();
+     return;
+@@ -88,12 +99,13 @@ void NotesActivity::render(RenderLock&&) {
+   if (!storageOk) {
+     renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, listTop, "SD card not available.");
+   } else {
+-    const int itemCount = 1 + store.fileCount();
++    const int itemCount = kFixedRows + store.fileCount();
+     GUI.drawList(
+         renderer, Rect{0, listTop, pageWidth, listHeight}, itemCount, selectorIndex,
+         [this](int index) -> std::string {
+           if (index == 0) return "+ New note";
+-          return std::string(store.file(index - 1).title);
++          if (index == 1) return "Pair keyboard";
++          return std::string(store.file(index - kFixedRows).title);
+         },
+         nullptr, nullptr);
+   }
+diff --git a/src/activities/notes/ble/KeyQueue.cpp b/src/activities/notes/ble/KeyQueue.cpp
+new file mode 100644
+index 0000000..573d2f3
+--- /dev/null
++++ b/src/activities/notes/ble/KeyQueue.cpp
+@@ -0,0 +1,48 @@
++#include "KeyQueue.h"
++
++#include <freertos/FreeRTOS.h>
++
++// MicroSlate's ring buffer, with one adaptation: the original guarded with
++// noInterrupts()/interrupts(), which on ESP32 doesn't protect against the
++// *other core* — and NimBLE's notify callback (the producer) runs on a
++// separate FreeRTOS task that may be on the other core. A spinlock critical
++// section protects both cores.
++static KeyEvent inputQueue[INPUT_QUEUE_SIZE];
++static int queueHead = 0;
++static int queueTail = 0;
++static volatile bool queueFull = false;
++static portMUX_TYPE queueMux = portMUX_INITIALIZER_UNLOCKED;
++
++void enqueueKeyEvent(uint8_t keyCode, uint8_t modifiers, bool pressed) {
++  taskENTER_CRITICAL(&queueMux);
++  if (!queueFull) {
++    inputQueue[queueHead].keyCode = keyCode;
++    inputQueue[queueHead].modifiers = modifiers;
++    inputQueue[queueHead].pressed = pressed;
++    queueHead = (queueHead + 1) % INPUT_QUEUE_SIZE;
++    if (queueHead == queueTail) queueFull = true;
++  }
++  taskEXIT_CRITICAL(&queueMux);
++}
++
++bool dequeueKeyEvent(KeyEvent& out) {
++  bool got = false;
++  taskENTER_CRITICAL(&queueMux);
++  const bool empty = (queueHead == queueTail) && !queueFull;
++  if (!empty) {
++    out = inputQueue[queueTail];
++    queueTail = (queueTail + 1) % INPUT_QUEUE_SIZE;
++    queueFull = false;
++    got = true;
++  }
++  taskEXIT_CRITICAL(&queueMux);
++  return got;
++}
++
++void clearKeyQueue() {
++  taskENTER_CRITICAL(&queueMux);
++  queueHead = 0;
++  queueTail = 0;
++  queueFull = false;
++  taskEXIT_CRITICAL(&queueMux);
++}
+diff --git a/src/activities/notes/ble/KeyQueue.h b/src/activities/notes/ble/KeyQueue.h
+new file mode 100644
+index 0000000..49bd144
+--- /dev/null
++++ b/src/activities/notes/ble/KeyQueue.h
+@@ -0,0 +1,9 @@
++#pragma once
++#include "ble_compat.h"
++
++// Key-event queue between the BLE notify callback (producer, NimBLE task)
++// and the Activity loop (consumer, main task). Extracted from MicroSlate's
++// input_handler.cpp — same ring-buffer logic.
++void enqueueKeyEvent(uint8_t keyCode, uint8_t modifiers, bool pressed);
++bool dequeueKeyEvent(KeyEvent& out);  // false if queue empty
++void clearKeyQueue();
+diff --git a/src/activities/notes/ble/KeyboardPairingActivity.cpp b/src/activities/notes/ble/KeyboardPairingActivity.cpp
+new file mode 100644
+index 0000000..ca83dfa
+--- /dev/null
++++ b/src/activities/notes/ble/KeyboardPairingActivity.cpp
+@@ -0,0 +1,140 @@
++#include "KeyboardPairingActivity.h"
++
++#include <GfxRenderer.h>
++
++#include <cstdio>
++
++#include "ble_keyboard.h"
++#include "components/UITheme.h"
++#include "fontIds.h"
++
++void KeyboardPairingActivity::onEnter() {
++  Activity::onEnter();
++  bleSetup();  // idempotent — initializes NimBLE on first use only
++  startDeviceScan();
++  selectorIndex = 0;
++  lastShownPasskey = 0;
++  lastShownDeviceCount = -1;
++  lastShownState = -1;
++  requestUpdateAndWait();
++}
++
++void KeyboardPairingActivity::onExit() {
++  stopDeviceScan();
++  Activity::onExit();
++}
++
++void KeyboardPairingActivity::loop() {
++  bleLoop();
++
++  const int deviceCount = getDiscoveredDeviceCount();
++
++  buttonNavigator.onNext([this, deviceCount] {
++    if (deviceCount > 0) {
++      selectorIndex = ButtonNavigator::nextIndex(selectorIndex, deviceCount);
++      requestUpdate();
++    }
++  });
++  buttonNavigator.onPrevious([this, deviceCount] {
++    if (deviceCount > 0) {
++      selectorIndex = ButtonNavigator::previousIndex(selectorIndex, deviceCount);
++      requestUpdate();
++    }
++  });
++
++  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm) && deviceCount > 0) {
++    if (selectorIndex < deviceCount) {
++      connectToDevice(selectorIndex);
++      requestUpdate();
++    }
++  }
++
++  if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
++    finish();
++    return;
++  }
++
++  // Poll for async state changes (scan results arriving, passkey appearing,
++  // connection completing) — redraw only when something actually changed,
++  // at most twice a second, to respect the e-ink panel.
++  if (millis() - lastPollMs > 500) {
++    lastPollMs = millis();
++    const uint32_t passkey = getCurrentPasskey();
++    const int state = static_cast<int>(getConnectionState());
++    if (passkey != lastShownPasskey || deviceCount != lastShownDeviceCount || state != lastShownState) {
++      requestUpdate();
++    }
++  }
++}
++
++void KeyboardPairingActivity::render(RenderLock&&) {
++  renderer.clearScreen();
++
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const auto pageWidth = renderer.getScreenWidth();
++  const auto pageHeight = renderer.getScreenHeight();
++
++  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, "Pair keyboard");
++
++  int y = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
++  const int lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
++  const int x = metrics.contentSidePadding;
++
++  // Connection state line
++  const char* stateText = "";
++  switch (getConnectionState()) {
++    case BLEState::CONNECTED: stateText = "Keyboard connected"; break;
++    case BLEState::CONNECTING: stateText = "Connecting..."; break;
++    case BLEState::SCANNING: stateText = "Scanning for keyboards..."; break;
++    case BLEState::DISCONNECTED: stateText = "Not connected"; break;
++  }
++  renderer.drawText(UI_10_FONT_ID, x, y, stateText);
++  y += lineHeight + metrics.verticalSpacing;
++
++  // Passkey, when the keyboard asks for one
++  const uint32_t passkey = getCurrentPasskey();
++  lastShownPasskey = passkey;
++  lastShownDeviceCount = getDiscoveredDeviceCount();
++  lastShownState = static_cast<int>(getConnectionState());
++  if (passkey > 0) {
++    char passkeyStr[16];
++    snprintf(passkeyStr, sizeof(passkeyStr), "%06lu", static_cast<unsigned long>(passkey));
++    renderer.drawText(UI_12_FONT_ID, x, y, "Type this code on the keyboard,", true);
++    y += lineHeight + 2;
++    renderer.drawText(UI_12_FONT_ID, x, y, "then press Enter:", true);
++    y += lineHeight + metrics.verticalSpacing;
++    renderer.drawText(UI_12_FONT_ID, x, y, passkeyStr, true, EpdFontFamily::BOLD);
++    y += lineHeight + metrics.verticalSpacing;
++  }
++
++  // Device list
++  const int deviceCount = getDiscoveredDeviceCount();
++  if (deviceCount > 0) {
++    BleDeviceInfo* devices = getDiscoveredDevices();
++    const int listBottom = pageHeight - metrics.buttonHintsHeight - metrics.verticalSpacing;
++    for (int i = 0; i < deviceCount; i++) {
++      if (y + lineHeight > listBottom) break;
++
++      const char* name = devices[i].name.empty() ? devices[i].address.c_str() : devices[i].name.c_str();
++      char row[80];
++      snprintf(row, sizeof(row), "%s  (%d dBm)", name, devices[i].rssi);
++
++      if (i == selectorIndex) {
++        renderer.fillRect(0, y - 2, pageWidth, lineHeight + 4);
++        renderer.drawText(UI_10_FONT_ID, x, y, row, false);
++      } else {
++        renderer.drawText(UI_10_FONT_ID, x, y, row);
++      }
++      y += lineHeight + 6;
++    }
++  } else if (passkey == 0) {
++    renderer.drawText(UI_10_FONT_ID, x, y, "No keyboards found yet.");
++    y += lineHeight;
++    renderer.drawText(UI_10_FONT_ID, x, y, "Put the keyboard in pairing mode.");
++  }
++
++  const auto labels = mappedInput.mapLabels("Back", deviceCount > 0 ? "Connect" : "", "", "");
++  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
++
++  renderer.displayBuffer();
++}
+diff --git a/src/activities/notes/ble/KeyboardPairingActivity.h b/src/activities/notes/ble/KeyboardPairingActivity.h
+new file mode 100644
+index 0000000..62df5d5
+--- /dev/null
++++ b/src/activities/notes/ble/KeyboardPairingActivity.h
+@@ -0,0 +1,25 @@
++#pragma once
++#include "../../Activity.h"
++#include "util/ButtonNavigator.h"
++
++// BLE keyboard pairing screen: scans for HID keyboards, lists them with
++// signal strength, connects on Confirm, and shows the pairing passkey when
++// the keyboard requires typing one. Wraps MicroSlate's ble_keyboard.cpp
++// (used unmodified) with a CrossPoint Activity UI.
++class KeyboardPairingActivity final : public Activity {
++ public:
++  explicit KeyboardPairingActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
++      : Activity("KeyboardPairing", renderer, mappedInput) {}
++  void onEnter() override;
++  void onExit() override;
++  void loop() override;
++  void render(RenderLock&&) override;
++
++ private:
++  ButtonNavigator buttonNavigator;
++  int selectorIndex = 0;
++  uint32_t lastShownPasskey = 0;
++  int lastShownDeviceCount = -1;
++  int lastShownState = -1;
++  unsigned long lastPollMs = 0;
++};
+diff --git a/src/activities/notes/ble/NoteKeyInput.cpp b/src/activities/notes/ble/NoteKeyInput.cpp
+new file mode 100644
+index 0000000..70848ba
+--- /dev/null
++++ b/src/activities/notes/ble/NoteKeyInput.cpp
+@@ -0,0 +1,107 @@
++#include "NoteKeyInput.h"
++
++#include "KeyQueue.h"
++#include "dead_keys.h"
++
++namespace {
++constexpr uint8_t kModCtrl = 0x01 | 0x10;   // L-Ctrl | R-Ctrl
++constexpr uint8_t kModShift = 0x02 | 0x20;  // L-Shift | R-Shift
++bool isCtrl(uint8_t m) { return m & kModCtrl; }
++bool isShift(uint8_t m) { return m & kModShift; }
++}  // namespace
++
++void NoteKeyInput::reset() {
++  capsLockOn = false;
++  deadKeyReset();
++  clearKeyQueue();
++}
++
++char NoteKeyInput::hidToAscii(uint8_t hid, uint8_t modifiers, bool capsLockOn) {
++  const bool shifted = isShift(modifiers) ^ capsLockOn;
++
++  // Letters a-z (HID 0x04-0x1D)
++  if (hid >= 0x04 && hid <= 0x1D) {
++    const char base = 'a' + (hid - 0x04);
++    return shifted ? (base - 32) : base;
++  }
++
++  // Number row (HID 0x1E-0x27) — caps lock does not shift numbers
++  static const char unshifted[] = "1234567890";
++  static const char shiftedNum[] = "!@#$%^&*()";
++  if (hid >= 0x1E && hid <= 0x27) {
++    const int idx = hid - 0x1E;
++    return isShift(modifiers) ? shiftedNum[idx] : unshifted[idx];
++  }
++
++  switch (hid) {
++    case HID_KEY_ENTER: return '\n';
++    case HID_KEY_TAB: return '\t';
++    case HID_KEY_SPACE: return ' ';
++    case 0x2D: return isShift(modifiers) ? '_' : '-';
++    case 0x2E: return isShift(modifiers) ? '+' : '=';
++    case 0x2F: return isShift(modifiers) ? '{' : '[';
++    case 0x30: return isShift(modifiers) ? '}' : ']';
++    case 0x31: return isShift(modifiers) ? '|' : '\\';
++    case 0x33: return isShift(modifiers) ? ':' : ';';
++    case 0x34: return isShift(modifiers) ? '"' : '\'';
++    case 0x35: return isShift(modifiers) ? '~' : '`';
++    case 0x36: return isShift(modifiers) ? '<' : ',';
++    case 0x37: return isShift(modifiers) ? '>' : '.';
++    case 0x38: return isShift(modifiers) ? '?' : '/';
++    default: return 0;
++  }
++}
++
++bool NoteKeyInput::applyKey(NoteEditor& editor, uint8_t keyCode, uint8_t modifiers, bool& saveRequested) {
++  if (isCtrl(modifiers)) {
++    if (keyCode == HID_KEY_S) {
++      saveRequested = true;
++      return true;
++    }
++    return false;  // other Ctrl shortcuts (modes/fonts) not ported yet
++  }
++
++  switch (keyCode) {
++    case HID_KEY_LEFT: editor.moveCursorLeft(); return true;
++    case HID_KEY_RIGHT: editor.moveCursorRight(); return true;
++    case HID_KEY_UP: editor.moveCursorUp(); return true;
++    case HID_KEY_DOWN: editor.moveCursorDown(); return true;
++    case HID_KEY_HOME: editor.moveCursorHome(); return true;
++    case HID_KEY_END: editor.moveCursorEnd(); return true;
++    case HID_KEY_BACKSPACE:
++      deadKeyReset();  // dead key + backspace → discard dead key (MicroSlate behavior)
++      editor.deleteChar();
++      return true;
++    case HID_KEY_DELETE: editor.deleteForward(); return true;
++    case HID_KEY_CAPSLOCK: capsLockOn = !capsLockOn; return false;
++    default: break;
++  }
++
++  // Printable character — through the US-International dead key engine
++  const char c = hidToAscii(keyCode, modifiers, capsLockOn);
++  if (c == 0) return false;
++
++  const char* composed = deadKeyProcess(c);
++  if (composed == nullptr) {
++    editor.insertChar(c);
++    return true;
++  }
++  if (composed[0] != '\0') {
++    editor.insertUtf8(composed);
++    const char req = deadKeyTakeRequeue();
++    if (req != 0) editor.insertChar(req);
++    return true;
++  }
++  // Dead key stored, nothing visible yet
++  return false;
++}
++
++bool NoteKeyInput::processPending(NoteEditor& editor, bool& saveRequested) {
++  bool changed = false;
++  KeyEvent event;
++  while (dequeueKeyEvent(event)) {
++    if (!event.pressed) continue;  // act on press, ignore releases
++    if (applyKey(editor, event.keyCode, event.modifiers, saveRequested)) changed = true;
++  }
++  return changed;
++}
+diff --git a/src/activities/notes/ble/NoteKeyInput.h b/src/activities/notes/ble/NoteKeyInput.h
+new file mode 100644
+index 0000000..c18fc97
+--- /dev/null
++++ b/src/activities/notes/ble/NoteKeyInput.h
+@@ -0,0 +1,24 @@
++#pragma once
++#include "../NoteEditor.h"
++#include "ble_compat.h"
++
++// The editor-input path from MicroSlate's input_handler.cpp: HID keycode +
++// modifiers → editor operation, printable chars routed through the
++// US-International dead-key engine (dead_keys.h). Only the editor path is
++// ported — MicroSlate's menu/settings key handling stayed behind, since
++// navigation here is CrossPoint Activities.
++class NoteKeyInput {
++ public:
++  // Drain the key queue, applying events to the editor.
++  // Returns true if anything changed (caller should requestUpdate()).
++  // saveRequested is set when Ctrl+S was pressed.
++  bool processPending(NoteEditor& editor, bool& saveRequested);
++
++  void reset();  // clear caps lock + pending dead key (call on activity enter)
++
++ private:
++  bool applyKey(NoteEditor& editor, uint8_t keyCode, uint8_t modifiers, bool& saveRequested);
++  static char hidToAscii(uint8_t hid, uint8_t modifiers, bool capsLockOn);
++
++  bool capsLockOn = false;
++};
+diff --git a/src/activities/notes/ble/ble_compat.h b/src/activities/notes/ble/ble_compat.h
+new file mode 100644
+index 0000000..e2bf25f
+--- /dev/null
++++ b/src/activities/notes/ble/ble_compat.h
+@@ -0,0 +1,95 @@
++#pragma once
++// Compatibility layer so MicroSlate's ble_keyboard.cpp compiles unmodified
++// inside the CrossPoint tree. Provides the pieces it pulled from
++// MicroSlate's config.h and sd_backup.h, mapped to CrossPoint equivalents
++// (HalStorage instead of SDCardManager, Serial logging for DBG_*).
++#include <Arduino.h>
++#include <HalStorage.h>
++
++#include <cstring>
++
++enum class BLEState : uint8_t { DISCONNECTED, SCANNING, CONNECTING, CONNECTED };
++
++struct KeyEvent {
++  uint8_t keyCode;
++  uint8_t modifiers;
++  bool pressed;
++};
++
++static constexpr int INPUT_QUEUE_SIZE = 32;
++
++// HID usage IDs referenced by the input layer (USB HID usage table 0x07)
++static constexpr uint8_t HID_KEY_ENTER = 0x28;
++static constexpr uint8_t HID_KEY_ESCAPE = 0x29;
++static constexpr uint8_t HID_KEY_BACKSPACE = 0x2A;
++static constexpr uint8_t HID_KEY_TAB = 0x2B;
++static constexpr uint8_t HID_KEY_SPACE = 0x2C;
++static constexpr uint8_t HID_KEY_CAPSLOCK = 0x39;
++static constexpr uint8_t HID_KEY_HOME = 0x4A;
++static constexpr uint8_t HID_KEY_DELETE = 0x4C;
++static constexpr uint8_t HID_KEY_END = 0x4D;
++static constexpr uint8_t HID_KEY_RIGHT = 0x4F;
++static constexpr uint8_t HID_KEY_LEFT = 0x50;
++static constexpr uint8_t HID_KEY_DOWN = 0x51;
++static constexpr uint8_t HID_KEY_UP = 0x52;
++static constexpr uint8_t HID_KEY_S = 0x16;
++
++#ifndef DBG_PRINTF
++#define DBG_PRINTF(fmt, ...) Serial.printf(fmt, ##__VA_ARGS__)
++#define DBG_PRINTLN(s) Serial.println(s)
++#endif
++
++// --- MicroSlate's sd_backup.h helpers, reimplemented on HalStorage ---
++
++static inline bool sdReadFile(const char* path, char* buf, size_t bufSize) {
++  const size_t n = Storage.readFileToBuffer(path, buf, bufSize);
++  return n > 0;
++}
++
++static inline bool sdWriteFile(const char* path, const char* content) {
++  // Ensure the parent directory exists (path is like /microslate/ble_kb.json)
++  char dir[64];
++  strncpy(dir, path, sizeof(dir) - 1);
++  dir[sizeof(dir) - 1] = '\0';
++  if (char* slash = strrchr(dir, '/'); slash && slash != dir) {
++    *slash = '\0';
++    Storage.ensureDirectoryExists(dir);
++  }
++  return Storage.writeFile(path, String(content));
++}
++
++static inline int jsonGetInt(const char* json, const char* key) {
++  char needle[32];
++  snprintf(needle, sizeof(needle), "\"%s\":", key);
++  const char* p = strstr(json, needle);
++  if (!p) return -1;
++  p += strlen(needle);
++  while (*p == ' ') p++;
++  return atoi(p);
++}
++
++static inline bool jsonGetStr(const char* json, const char* key, char* out, size_t outSize) {
++  char needle[32];
++  snprintf(needle, sizeof(needle), "\"%s\":\"", key);
++  const char* p = strstr(json, needle);
++  if (!p) return false;
++  p += strlen(needle);
++  size_t i = 0;
++  while (*p && i < outSize - 1) {
++    if (*p == '"') break;
++    if (*p == '\\' && *(p + 1)) {
++      p++;
++      switch (*p) {
++        case '"': out[i++] = '"'; break;
++        case '\\': out[i++] = '\\'; break;
++        case 'n': out[i++] = '\n'; break;
++        default: out[i++] = *p; break;
++      }
++    } else {
++      out[i++] = *p;
++    }
++    p++;
++  }
++  out[i] = '\0';
++  return true;
++}
+diff --git a/src/activities/notes/ble/ble_keyboard.cpp b/src/activities/notes/ble/ble_keyboard.cpp
+new file mode 100644
+index 0000000..5372e82
+--- /dev/null
++++ b/src/activities/notes/ble/ble_keyboard.cpp
+@@ -0,0 +1,931 @@
++#include "ble_keyboard.h"
++#include "KeyQueue.h"
++
++
++#include <NimBLEDevice.h>
++#include <Preferences.h>
++
++// MicroSlate signalled its single-loop UI to redraw by setting a global
++// screenDirty flag on BLE state changes. CrossPoint Activities poll BLE
++// state in their own loop() instead (see KeyboardPairingActivity), so this
++// flag exists only to keep this file byte-compatible with upstream
++// MicroSlate — nothing reads it here.
++bool screenDirty = false;
++
++// HID service and characteristic UUIDs
++static NimBLEUUID hidServiceUUID("1812");
++static NimBLEUUID reportUUID("2a4d");
++static NimBLEUUID reportMapUUID("2a4b");
++static NimBLEUUID protocolModeUUID("2a4e");
++static NimBLEUUID bootKeyboardInUUID("2a22");
++
++// Module state
++static NimBLEClient* pClient = nullptr;
++static NimBLERemoteService* pRemoteService = nullptr;
++static NimBLERemoteCharacteristic* pInputReportChar = nullptr;
++
++static BLEState bleState = BLEState::DISCONNECTED;
++static bool connectToKeyboard = false;
++static std::string keyboardAddress = "";
++static uint8_t keyboardAddressType = 0;
++static uint8_t lastReport[8] = {0};
++static uint8_t inputReportId = 0;   // Non-zero if keyboard prefixes reports with a report ID
++
++// NVS storage for persistent pairing
++static Preferences prefs;
++
++// Global flag to control auto-reconnect behavior
++bool autoReconnectEnabled = true;
++
++// Reconnection backoff
++static unsigned long reconnectDelay = 5000;   // 5s initial — gives keyboard time to release old connection after deep sleep
++static unsigned long lastReconnectAttempt = 0;
++static constexpr unsigned long MAX_RECONNECT_DELAY = 120000;  // Cap at 2min (was 60s)
++
++// Multi-keyboard cycling: index of the keyboard to try on the next auto-reconnect attempt
++static int reconnectKeyboardIndex = 0;
++
++// Activity tracking (used by connect task to initialise idle timer)
++static unsigned long lastBleKeystrokeMs = 0;
++static bool bleConnIdleMode = false;
++
++// Device discovery variables
++static std::vector<BleDeviceInfo> discoveredDevices;
++static bool isScanning = false;
++static bool continuousScanning = false;
++static uint32_t scanStartMs = 0;
++static constexpr uint32_t DEVICE_STALE_MS = 10000;  // 10 seconds - reduced to prevent UI slowdown
++
++// FreeRTOS connect task
++static TaskHandle_t connectTaskHandle = nullptr;
++static volatile bool authSuccess = false;
++
++// Connection timeout in seconds
++static constexpr uint32_t CONNECT_TIMEOUT_MS = 10000;
++
++// Global variable to store the passkey for display
++static uint32_t currentPasskey = 0;
++
++// Forward declarations
++static bool setupHidConnection();
++int getLastUsedKeyboardIndex();
++
++// Helper: upsert device into discovered list
++static void upsertDevice(const BleDeviceInfo& info) {
++  for (auto &d : discoveredDevices) {
++    if (d.address == info.address) {
++      d = info;
++      return;
++    }
++  }
++  discoveredDevices.push_back(info);
++}
++
++// Helper: prune devices not seen recently
++static void pruneStaleDevices() {
++  uint32_t now = millis();
++  for (int i = (int)discoveredDevices.size() - 1; i >= 0; --i) {
++    if (now - discoveredDevices[i].lastSeenMs > DEVICE_STALE_MS) {
++      discoveredDevices.erase(discoveredDevices.begin() + i);
++    }
++  }
++}
++
++// Keyboard notification callback
++static void onKeyboardNotify(NimBLERemoteCharacteristic* pRemChar,
++                              uint8_t* pData, size_t length, bool isNotify) {
++  // Strip report ID prefix if the keyboard uses one (learned during HID discovery).
++  // e.g. 9-byte: [ReportID][Mod][Reserved][K1-K6]  →  strip to 8-byte standard
++  //      8-byte: [ReportID][Mod][K1-K6]             →  strip to 7-byte compact
++  if (inputReportId != 0 && length > 0 && pData[0] == inputReportId) {
++    pData++;
++    length--;
++  }
++
++  // Must be 7 or 8 bytes after stripping. Consumer-control / media-key reports
++  // from other report IDs arrive here too — silently ignore them.
++  if (length < 7 || length > 8) {
++    DBG_PRINTF("[KB-Notify] Ignoring %d-byte report (not keyboard format)\n", (int)length);
++    return;
++  }
++
++  uint8_t modifiers = pData[0];
++  uint8_t newReport[8] = {0};
++
++  // Normalize to 8-byte format: [Mod] [Reserved=0] [Key1-Key6]
++  if (length == 8) {
++    memcpy(newReport, pData, 8);
++  } else {
++    // 7-byte compact: insert reserved byte
++    newReport[0] = pData[0];  // Modifiers
++    newReport[1] = 0;          // Reserved
++    memcpy(&newReport[2], &pData[1], 6);
++  }
++
++#ifndef RELEASE_BUILD
++  Serial.print("KB: ");
++  for (int i = 0; i < 8; i++) Serial.printf("%02X ", newReport[i]);
++  Serial.println();
++#endif
++
++  // Detect newly pressed keys (bytes 2-7 in normalized format)
++  for (int i = 2; i < 8; i++) {
++    if (newReport[i] == 0) continue;
++    bool wasPressed = false;
++    for (int j = 2; j < 8; j++) {
++      if (lastReport[j] == newReport[i]) { wasPressed = true; break; }
++    }
++    if (!wasPressed) {
++      DBG_PRINTF("  KEY PRESS: 0x%02X mod=0x%02X\n", newReport[i], modifiers);
++      enqueueKeyEvent(newReport[i], modifiers, true);
++    }
++  }
++
++  // Detect released keys
++  for (int i = 2; i < 8; i++) {
++    if (lastReport[i] == 0) continue;
++    bool stillPressed = false;
++    for (int j = 2; j < 8; j++) {
++      if (newReport[j] == lastReport[i]) { stillPressed = true; break; }
++    }
++    if (!stillPressed) {
++      DBG_PRINTF("  KEY RELEASE: 0x%02X\n", lastReport[i]);
++      enqueueKeyEvent(lastReport[i], modifiers, false);
++    }
++  }
++
++  memcpy(lastReport, newReport, 8);
++
++  // Track activity for adaptive connection parameters
++  lastBleKeystrokeMs = millis();
++}
++
++// --- Callbacks (static instances, no heap allocation) ---
++
++static class ScanCallbacks : public NimBLEScanCallbacks {
++  void onResult(const NimBLEAdvertisedDevice* dev) override {
++    BleDeviceInfo info;
++    info.address = dev->getAddress().toString();
++    info.name = dev->haveName() ? dev->getName() : info.address;
++    info.rssi = dev->getRSSI();
++    info.addressType = dev->getAddress().getType();
++    info.lastSeenMs = millis();
++    upsertDevice(info);
++    extern bool screenDirty;
++    screenDirty = true;
++  }
++} scanCallbacks;
++
++static class ClientCallbacks : public NimBLEClientCallbacks {
++  void onConnect(NimBLEClient* pclient) override {
++    DBG_PRINTLN("[BLE] Connected to device");
++    // Don't call secureConnection() here - the connect task handles it
++  }
++
++  void onDisconnect(NimBLEClient* pclient, int reason) override {
++    bleState = BLEState::DISCONNECTED;
++    pInputReportChar = nullptr;
++    pRemoteService = nullptr;
++    authSuccess = false;
++    memset(lastReport, 0, 8);
++    lastReconnectAttempt = millis();
++    DBG_PRINTLN("[BLE] Disconnected");
++  }
++
++  bool onConnParamsUpdateRequest(NimBLEClient* pClient,
++                                  const ble_gap_upd_params* params) override {
++    // Reject the keyboard's connection parameter update request.
++    // Keychron keyboards send a conn param update on the first keypress (idle→active
++    // interval switch). Returning true makes NimBLE substitute our m_connParams into
++    // the response, which mismatches what the Keychron expects and causes an immediate
++    // crash/disconnect. Returning false tells the keyboard to keep the current params
++    // (30–50 ms interval negotiated at connect time), which works fine for all keyboards.
++    return false;
++  }
++
++  // Security callbacks (merged from NimBLESecurityCallbacks — removed in 2.x)
++  void onPassKeyEntry(NimBLEConnInfo& connInfo) override {
++    DBG_PRINTLN("[BLE] PassKeyEntry received - entering 123456");
++    NimBLEDevice::injectPassKey(connInfo, 123456);
++  }
++
++  void onConfirmPasskey(NimBLEConnInfo& connInfo, uint32_t pin) override {
++    DBG_PRINTF("[BLE] Confirm passkey: %06lu - auto-accepting\n", (unsigned long)pin);
++    currentPasskey = pin;
++    extern bool screenDirty;
++    screenDirty = true;
++    NimBLEDevice::injectConfirmPasskey(connInfo, true);
++  }
++
++  void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
++    DBG_PRINTF("[BLE] Auth complete: encrypted=%d bonded=%d\n",
++               connInfo.isEncrypted(), connInfo.isBonded());
++
++    if (connInfo.isEncrypted()) {
++      authSuccess = true;
++      DBG_PRINTLN("[BLE] Auth success");
++    } else {
++      authSuccess = false;
++      DBG_PRINTLN("[BLE] Auth failed - not encrypted");
++    }
++    currentPasskey = 0;
++    extern bool screenDirty;
++    screenDirty = true;
++  }
++} clientCallbacks;
++
++// --- HID service discovery and subscription ---
++
++static bool setupHidConnection() {
++  if (!pClient || !pClient->isConnected()) return false;
++
++  DBG_PRINTLN("[BLE] Discovering services...");
++  if (pClient->getServices(true).empty()) {
++    DBG_PRINTLN("[BLE] Service discovery failed");
++    return false;
++  }
++
++  pRemoteService = pClient->getService(hidServiceUUID);
++  if (!pRemoteService) {
++    DBG_PRINTLN("[BLE] HID service not found");
++    return false;
++  }
++
++  // Set report protocol mode FIRST (before subscribing)
++  NimBLEUUID protocolModeUUID((uint16_t)0x2a4e);  // Protocol Mode
++  NimBLERemoteCharacteristic* pProto = pRemoteService->getCharacteristic(protocolModeUUID);
++  if (pProto) {
++    uint8_t mode = 1;  // 1 = Report Protocol
++    pProto->writeValue(&mode, 1, true);
++    DBG_PRINTLN("[BLE] Set Protocol Mode to Report Protocol (1)");
++  } else {
++    DBG_PRINTLN("[BLE] WARNING: No Protocol Mode characteristic found");
++  }
++
++  // Find input report via Report Reference descriptor (type=1 means Input)
++  pInputReportChar = nullptr;
++  inputReportId = 0;
++  const auto& chars = pRemoteService->getCharacteristics(true);  // true = refresh from device
++  DBG_PRINTF("[BLE] Found %d characteristics in HID service\n", (int)chars.size());
++
++  for (auto& chr : chars) {
++    DBG_PRINTF("[BLE]   Char UUID: %s, canNotify=%d\n",
++               chr->getUUID().toString().c_str(), chr->canNotify());
++
++    if (chr->getUUID() != reportUUID) continue;
++
++    const auto& descs = chr->getDescriptors();
++    for (auto& d : descs) {
++      if (d->getUUID() == NimBLEUUID("2908")) {
++        NimBLEAttValue refData = d->readValue();
++        if (refData.size() >= 2) {
++          DBG_PRINTF("[BLE]     Report ref: ID=%d Type=%d\n",
++                     (uint8_t)refData[0], (uint8_t)refData[1]);
++          if ((uint8_t)refData[1] == 1) {
++            pInputReportChar = chr;
++            inputReportId = (uint8_t)refData[0];  // 0 = no ID prefix, non-zero = ID byte present
++            DBG_PRINTF("[BLE]     -> Selected as input report (reportId=%d)\n", inputReportId);
++            break;
++          }
++        }
++      }
++    }
++    if (pInputReportChar) break;
++  }
++
++  // Fallback: subscribe to ALL notifiable report chars to find keyboard input
++  if (!pInputReportChar) {
++    DBG_PRINTLN("[BLE] No report ref found, subscribing to ALL notifiable report chars");
++    int reportCount = 0;
++    for (auto& chr : chars) {
++      if (chr->getUUID() == reportUUID && chr->canNotify()) {
++        DBG_PRINTF("[BLE] Attempting subscribe to Report handle=%d...\n", chr->getHandle());
++        if (chr->subscribe(true, onKeyboardNotify)) {
++          reportCount++;
++          DBG_PRINTF("[BLE] SUCCESS - Subscribed to report char #%d (handle=%d)\n",
++                     reportCount, chr->getHandle());
++          if (reportCount == 1) {
++            pInputReportChar = chr;  // Keep first one as primary reference
++          }
++        } else {
++          DBG_PRINTF("[BLE] FAILED to subscribe to report char handle=%d\n", chr->getHandle());
++        }
++      }
++    }
++    if (reportCount > 0) {
++      DBG_PRINTF("[BLE] Total: Subscribed to %d report characteristics\n", reportCount);
++    } else {
++      DBG_PRINTLN("[BLE] WARNING: Failed to subscribe to any report characteristics!");
++    }
++  }
++
++  // Fallback: boot keyboard input
++  if (!pInputReportChar) {
++    DBG_PRINTLN("[BLE] No report char found, trying boot keyboard input");
++    pInputReportChar = pRemoteService->getCharacteristic(bootKeyboardInUUID);
++    if (pInputReportChar) {
++      DBG_PRINTLN("[BLE] Using boot keyboard input");
++    }
++  }
++
++  if (!pInputReportChar) {
++    DBG_PRINTLN("[BLE] No input report found");
++    return false;
++  }
++
++  // If we have a specific input report char (from report ref or boot keyboard),
++  // and we haven't already subscribed to it, subscribe now
++  if (pInputReportChar->getUUID() != reportUUID || !pInputReportChar->canNotify()) {
++    DBG_PRINTF("[BLE] Subscribing to char %s\n", pInputReportChar->getUUID().toString().c_str());
++    if (!pInputReportChar->subscribe(true, onKeyboardNotify)) {
++      DBG_PRINTLN("[BLE] Subscribe failed");
++      return false;
++    }
++    DBG_PRINTLN("[BLE] Subscribe succeeded");
++  } else {
++    DBG_PRINTLN("[BLE] Already subscribed to report char(s)");
++  }
++
++  DBG_PRINTLN("[BLE] HID setup complete");
++  return true;
++}
++
++// --- FreeRTOS task: runs connect + security + HID setup off the main loop ---
++
++static void bleConnectTask(void* param) {
++  bleState = BLEState::CONNECTING;
++  authSuccess = false;
++
++  DBG_PRINTF("[BLE-Task] Connecting to %s type=%d\n",
++             keyboardAddress.c_str(), keyboardAddressType);
++
++  // Guard: if the link layer is already up (bleState flipped to DISCONNECTED spuriously
++  // while the BLE connection is still alive), don't call connect() again — that crashes
++  // the NimBLE stack. Just re-sync state and exit.
++  if (pClient && pClient->isConnected()) {
++    DBG_PRINTLN("[BLE-Task] Already connected - re-syncing state");
++    bleState = BLEState::CONNECTED;
++    lastBleKeystrokeMs = millis();
++    bleConnIdleMode = false;
++    connectTaskHandle = nullptr;
++    vTaskDelete(NULL);
++    return;
++  }
++
++  // Create/reuse client
++  if (!pClient) {
++    pClient = NimBLEDevice::createClient();
++    pClient->setClientCallbacks(&clientCallbacks, false);
++  }
++  pClient->setConnectTimeout(CONNECT_TIMEOUT_MS);
++
++  // Step 1: Connect (blocks this task, main loop continues)
++  NimBLEAddress addr(keyboardAddress, keyboardAddressType);
++  // Delete any stored bond before connecting — forces a fresh "Just Works" pairing
++  // instead of an encrypted reconnect. Prevents a NimBLE security-state crash when
++  // the keyboard still holds a stale connection from a previous unclean disconnect.
++  NimBLEDevice::deleteBond(addr);
++  if (!pClient->connect(addr, true)) {
++    DBG_PRINTLN("[BLE-Task] Connection failed");
++    bleState = BLEState::DISCONNECTED;
++    connectTaskHandle = nullptr;
++    vTaskDelete(NULL);
++    return;
++  }
++
++  DBG_PRINTLN("[BLE-Task] Connected, attempting security...");
++
++  // Step 2: Try security pairing (optional for some keyboards)
++  // If this fails, we'll still try HID setup in case the keyboard doesn't require auth
++  bool secureAttempted = pClient->secureConnection();
++
++  if (secureAttempted) {
++    // Wait for auth callbacks
++    unsigned long secStart = millis();
++    while (!authSuccess && (millis() - secStart < 5000)) {
++      vTaskDelay(pdMS_TO_TICKS(100));
++    }
++
++    if (authSuccess) {
++      DBG_PRINTLN("[BLE-Task] Security succeeded");
++    } else {
++      DBG_PRINTLN("[BLE-Task] Security failed/timeout - trying HID anyway");
++    }
++  } else {
++    DBG_PRINTLN("[BLE-Task] secureConnection() returned false - trying HID anyway");
++  }
++
++  DBG_PRINTLN("[BLE-Task] Setting up HID...");
++
++  // Step 4: Service discovery + HID subscription (blocks this task)
++  if (!setupHidConnection()) {
++    DBG_PRINTLN("[BLE-Task] HID setup failed, disconnecting");
++    if (pClient->isConnected()) pClient->disconnect();
++    bleState = BLEState::DISCONNECTED;
++    connectTaskHandle = nullptr;
++    vTaskDelete(NULL);
++    return;
++  }
++
++  // Step 5: Mark connected immediately so bleLoop doesn't start a second connect task.
++  // Do this BEFORE storePairedDevice (NVS write) to minimise the window where the link
++  // is live but bleState is still CONNECTING.
++  bleState = BLEState::CONNECTED;
++  reconnectDelay = 5000;  // Reset backoff after successful connection
++  bleConnIdleMode = false;
++  lastBleKeystrokeMs = millis();  // Start the 3s idle timer from now, not from boot
++  DBG_PRINTLN("[BLE-Task] Keyboard ready!");
++
++  // NOTE: updateConnParams() is intentionally NOT called here.  Calling it immediately
++  // after connecting triggers a reentrancy crash with Keychron keyboards (the keyboard
++  // sends its own BLE_GAP_EVENT_CONN_UPDATE_REQ at the same time).  The adaptive params
++  // logic in bleLoop() handles this safely from the main task after a stable delay.
++
++  // If the device didn't broadcast a name during scanning, read it from GATT now.
++  // Generic Access service (0x1800) Device Name characteristic (0x2A00).
++  {
++    NimBLERemoteService* gasSvc = pClient->getService(NimBLEUUID((uint16_t)0x1800));
++    if (gasSvc) {
++      NimBLERemoteCharacteristic* nameChr = gasSvc->getCharacteristic(NimBLEUUID((uint16_t)0x2A00));
++      if (nameChr) {
++        std::string gattName = nameChr->readValue();
++        if (!gattName.empty()) {
++          for (auto& d : discoveredDevices) {
++            if (d.address == keyboardAddress && d.name == keyboardAddress) {
++              d.name = gattName;
++              break;
++            }
++          }
++        }
++      }
++    }
++  }
++
++  // Store device to NVS for future reconnects, then reset cycling index to this keyboard
++  {
++    std::string devName = keyboardAddress;
++    for (auto& d : discoveredDevices) {
++      if (d.address == keyboardAddress) { devName = d.name; break; }
++    }
++    storePairedDevice(keyboardAddress, devName);
++    // After a successful connect, next auto-reconnect attempt starts from this keyboard
++    int newLastKb = getLastUsedKeyboardIndex();
++    reconnectKeyboardIndex = (newLastKb >= 0) ? newLastKb : 0;
++  }
++
++  connectTaskHandle = nullptr;
++  vTaskDelete(NULL);
++}
++
++// Launch the connect task (non-blocking from main loop's perspective)
++static void startConnectTask() {
++  if (connectTaskHandle != nullptr) {
++    DBG_PRINTLN("[BLE] Connect task already running");
++    return;
++  }
++  // 20480 bytes: Logitech has a complex service tree (keyboard + media + battery reports
++  // + many descriptors). NimBLE 2.x uses more per-call stack than 1.4.x — 12288 was
++  // sufficient before but overflows during full service discovery on the Logitech.
++  xTaskCreate(bleConnectTask, "ble_conn", 20480, NULL, 1, &connectTaskHandle);
++}
++
++// --- NVS multi-keyboard helpers ---
++
++static void nvs_kbKey(char* buf, int idx, const char* suffix) {
++  snprintf(buf, 16, "kb_%d_%s", idx, suffix);
++}
++
++static int nvs_loadCount() {
++  return (int)prefs.getUChar("kb_count", 0);
++}
++
++static std::string nvs_loadAddr(int idx) {
++  char key[16]; nvs_kbKey(key, idx, "addr");
++  return std::string(prefs.getString(key, "").c_str());
++}
++
++static std::string nvs_loadName(int idx) {
++  char key[16]; nvs_kbKey(key, idx, "name");
++  return std::string(prefs.getString(key, "").c_str());
++}
++
++static uint8_t nvs_loadType(int idx) {
++  char key[16]; nvs_kbKey(key, idx, "type");
++  return prefs.getUChar(key, 0);
++}
++
++static void nvs_saveKb(int idx, const std::string& addr, const std::string& name, uint8_t type) {
++  char key[16];
++  nvs_kbKey(key, idx, "addr"); prefs.putString(key, addr.c_str());
++  nvs_kbKey(key, idx, "name"); prefs.putString(key, name.c_str());
++  nvs_kbKey(key, idx, "type"); prefs.putUChar(key, type);
++}
++
++static void nvs_clearSlot(int idx) {
++  char key[16];
++  nvs_kbKey(key, idx, "addr"); prefs.remove(key);
++  nvs_kbKey(key, idx, "name"); prefs.remove(key);
++  nvs_kbKey(key, idx, "type"); prefs.remove(key);
++}
++
++// --- SD card backup for BLE pairing ---
++
++static constexpr char BLE_BACKUP_PATH[] = "/microslate/ble_kb.json";
++
++static void writeBleBackup() {
++    static char buf[512];
++    int count = nvs_loadCount();
++    int last  = (int)prefs.getUChar("last_kb", 0);
++    snprintf(buf, sizeof(buf), "{\"count\":%d,\"last\":%d", count, last);
++    for (int i = 0; i < count; i++) {
++        std::string addr = nvs_loadAddr(i);
++        std::string name = nvs_loadName(i);
++        uint8_t     type = nvs_loadType(i);
++        char tmp[16];
++        snprintf(tmp, sizeof(tmp), ",\"a%d\":\"", i);  strncat(buf, tmp, sizeof(buf) - strlen(buf) - 1);
++        jsonAppendStr(buf, sizeof(buf), addr.c_str());  strncat(buf, "\"", sizeof(buf) - strlen(buf) - 1);
++        snprintf(tmp, sizeof(tmp), ",\"n%d\":\"", i);  strncat(buf, tmp, sizeof(buf) - strlen(buf) - 1);
++        jsonAppendStr(buf, sizeof(buf), name.c_str());  strncat(buf, "\"", sizeof(buf) - strlen(buf) - 1);
++        snprintf(tmp, sizeof(tmp), ",\"t%d\":%d", i, type);
++        strncat(buf, tmp, sizeof(buf) - strlen(buf) - 1);
++    }
++    strncat(buf, "}", sizeof(buf) - strlen(buf) - 1);
++    if (!SdMan.exists("/microslate")) SdMan.mkdir("/microslate");
++    sdWriteFile(BLE_BACKUP_PATH, buf);
++}
++
++static void restoreBleBackup() {
++    static char buf[512];
++    if (!sdReadFile(BLE_BACKUP_PATH, buf, sizeof(buf))) return;
++    int count = jsonGetInt(buf, "count");
++    int last  = jsonGetInt(buf, "last");
++    if (count < 0) return;
++    for (int i = 0; i < count && i < MAX_PAIRED_KEYBOARDS; i++) {
++        char aKey[8], nKey[8], tKey[8];
++        snprintf(aKey, sizeof(aKey), "a%d", i);
++        snprintf(nKey, sizeof(nKey), "n%d", i);
++        snprintf(tKey, sizeof(tKey), "t%d", i);
++        char addr[32] = "", name[64] = "";
++        jsonGetStr(buf, aKey, addr, sizeof(addr));
++        jsonGetStr(buf, nKey, name, sizeof(name));
++        int type = jsonGetInt(buf, tKey);
++        if (addr[0]) nvs_saveKb(i, addr, name, (uint8_t)(type >= 0 ? type : 0));
++    }
++    prefs.putUChar("kb_count", (uint8_t)count);
++    if (last >= 0) prefs.putUChar("last_kb", (uint8_t)last);
++    DBG_PRINTF("[BLE] Restored %d paired keyboard(s) from SD backup\n", count);
++}
++
++// --- Public API ---
++
++uint32_t getCurrentPasskey() {
++  return currentPasskey;
++}
++
++void bleSetup() {
++  NimBLEDevice::init("MicroSlate");
++  // bond=true, MITM=false (we don't require it), SC=false (legacy compat for Logitech etc.)
++  // DISPLAY_YESNO: we can show a number and confirm — lets keyboards that *do* want
++  // numeric comparison (Apple Magic Keyboard, etc.) initiate it while still falling
++  // back to "Just Works" for keyboards that don't need it.
++  NimBLEDevice::setSecurityAuth(true, false, false);
++  // NO_INPUT_OUTPUT = "Just Works" pairing — works for both Logitech and Keychron
++  // since MITM=false means we never require authenticated pairing regardless of IO cap.
++  // DISPLAY_YESNO was tried for Keychron but broke Logitech (bond/security-state mismatch
++  // in NimBLE 2.x caused crashes on reconnect). Just Works is sufficient for all targets.
++  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
++  // ENC-only key distribution — omit ID (IRK) which some keyboards don't support
++  // and which caused bond-validation failures after the security param change.
++  NimBLEDevice::setSecurityInitKey(BLE_SM_PAIR_KEY_DIST_ENC);
++  NimBLEDevice::setSecurityRespKey(BLE_SM_PAIR_KEY_DIST_ENC);
++  NimBLEDevice::setPower(-9);  // -9dBm — lowest verified working power level
++
++  prefs.begin("ble_kb", false);
++
++  // Restore from SD backup if NVS was wiped (e.g. after a firmware flash)
++  if (!prefs.isKey("kb_count")) restoreBleBackup();
++
++  NimBLEScan* scan = NimBLEDevice::getScan();
++  scan->setScanCallbacks(&scanCallbacks, true);
++  scan->setInterval(1349);
++  scan->setWindow(449);
++  scan->setActiveScan(true);
++
++  // Migrate from old single-keyboard NVS format on first boot after firmware update.
++  // Sentinel: if "kb_count" key is absent (returns 0xFF default), run migration.
++  if (prefs.getUChar("kb_count", 0xFF) == 0xFF) {
++    String oldAddr = prefs.getString("addr", "");
++    if (oldAddr.length() > 0) {
++      String oldName = prefs.getString("name", oldAddr);
++      uint8_t oldType = prefs.getUChar("addrType", 0);
++      nvs_saveKb(0, std::string(oldAddr.c_str()), std::string(oldName.c_str()), oldType);
++      prefs.putUChar("kb_count", 1);
++      prefs.putUChar("last_kb", 0);
++      prefs.remove("addr");
++      prefs.remove("name");
++      prefs.remove("addrType");
++      DBG_PRINTLN("[BLE] Migrated single-keyboard NVS to multi-keyboard format");
++    } else {
++      prefs.putUChar("kb_count", 0);
++    }
++  }
++
++  // Prime auto-reconnect: start with last-used keyboard, give it 5s before first attempt
++  // so the keyboard's supervision timeout from the previous session has time to expire.
++  int pairedCount = nvs_loadCount();
++  int lastKb = (pairedCount > 0) ? (int)prefs.getUChar("last_kb", 0) : -1;
++  if (lastKb >= pairedCount) lastKb = 0;
++  reconnectKeyboardIndex = (lastKb >= 0) ? lastKb : 0;
++
++  if (pairedCount > 0 && lastKb >= 0) {
++    keyboardAddress = nvs_loadAddr(lastKb);
++    keyboardAddressType = nvs_loadType(lastKb);
++    lastReconnectAttempt = millis();
++    DBG_PRINTF("[BLE] Will reconnect to: %s (in %lums, %d paired total)\n",
++               keyboardAddress.c_str(), reconnectDelay, pairedCount);
++  } else {
++    bleState = BLEState::DISCONNECTED;
++    DBG_PRINTLN("[BLE] No paired keyboards");
++  }
++}
++
++void bleLoop() {
++  // Detect when a one-shot scan finishes
++  if (isScanning && !NimBLEDevice::getScan()->isScanning()) {
++    isScanning = false;
++    continuousScanning = false;
++    DBG_PRINTF("[BLE] Scan complete — found %d devices\n", (int)discoveredDevices.size());
++    // Trigger screen refresh to show final results
++    extern bool screenDirty;
++    screenDirty = true;
++  }
++
++  // Launch connect task if requested (non-blocking)
++  if (connectToKeyboard && bleState != BLEState::CONNECTED && connectTaskHandle == nullptr) {
++    connectToKeyboard = false;
++    startConnectTask();
++    return;
++  }
++
++  // Auto-reconnect: cycle through all paired keyboards with exponential backoff.
++  // Backoff increases only after a full cycle through all keyboards.
++  if (bleState == BLEState::DISCONNECTED && autoReconnectEnabled && connectTaskHandle == nullptr) {
++    int count = nvs_loadCount();
++    if (count > 0) {
++      unsigned long now = millis();
++      if (now - lastReconnectAttempt >= reconnectDelay) {
++        int idx = reconnectKeyboardIndex % count;
++        keyboardAddress = nvs_loadAddr(idx);
++        keyboardAddressType = nvs_loadType(idx);
++        connectToKeyboard = true;
++        lastReconnectAttempt = now;
++        DBG_PRINTF("[BLE] Auto-reconnect: trying keyboard %d/%d (%s)\n",
++                   idx + 1, count, keyboardAddress.c_str());
++        reconnectKeyboardIndex = (reconnectKeyboardIndex + 1) % count;
++        // Increase backoff only after a full cycle through all keyboards
++        if (reconnectKeyboardIndex == 0) {
++          reconnectDelay = (reconnectDelay * 2 > MAX_RECONNECT_DELAY)
++                             ? MAX_RECONNECT_DELAY : reconnectDelay * 2;
++        }
++      }
++    }
++  }
++}
++
++bool isKeyboardConnected() {
++  return bleState == BLEState::CONNECTED;
++}
++
++BLEState getConnectionState() {
++  return bleState;
++}
++
++void cancelPendingConnection() {
++  connectToKeyboard = false;
++  if (connectTaskHandle != nullptr) {
++    // Can't safely kill the task mid-connection, but prevent new attempts
++    DBG_PRINTLN("[BLE] Connection in progress, will complete in background");
++  }
++  if (bleState == BLEState::CONNECTING && connectTaskHandle == nullptr) {
++    bleState = BLEState::DISCONNECTED;
++  }
++}
++
++void startDeviceScan() {
++  cancelPendingConnection();
++
++  NimBLEDevice::getScan()->stop();
++  discoveredDevices.clear();
++  NimBLEDevice::getScan()->clearResults();
++
++  scanStartMs = millis();
++
++  NimBLEScan* scan = NimBLEDevice::getScan();
++  scan->setScanCallbacks(&scanCallbacks, true);
++  scan->setActiveScan(true);
++  scan->start(5000, false);  // One-shot 5-second scan (2.x API takes milliseconds)
++
++  isScanning = true;
++  continuousScanning = false;  // One-shot: no auto-restart
++  DBG_PRINTLN("[BLE] Started one-shot scan (5s)");
++}
++
++void stopDeviceScan() {
++  NimBLEDevice::getScan()->stop();
++  isScanning = false;
++  continuousScanning = false;
++}
++
++int getDiscoveredDeviceCount() {
++  return discoveredDevices.size();
++}
++
++BleDeviceInfo* getDiscoveredDevices() {
++  return discoveredDevices.empty() ? nullptr : discoveredDevices.data();
++}
++
++void connectToDevice(int deviceIndex) {
++  if (deviceIndex < 0 || deviceIndex >= (int)discoveredDevices.size()) {
++    DBG_PRINTLN("[BLE] Invalid device index");
++    return;
++  }
++
++  stopDeviceScan();
++
++  if (pClient && pClient->isConnected()) {
++    pClient->disconnect();
++  }
++
++  keyboardAddress = discoveredDevices[deviceIndex].address;
++  keyboardAddressType = discoveredDevices[deviceIndex].addressType;
++  connectToKeyboard = true;
++
++  DBG_PRINTF("[BLE] Will connect to: %s type=%d (%s)\n",
++             keyboardAddress.c_str(), keyboardAddressType,
++             discoveredDevices[deviceIndex].name.c_str());
++}
++
++void disconnectCurrentDevice() {
++  if (pClient && pClient->isConnected()) {
++    pClient->disconnect();
++  }
++  bleState = BLEState::DISCONNECTED;
++  pInputReportChar = nullptr;
++  pRemoteService = nullptr;
++  memset(lastReport, 0, 8);
++  lastReconnectAttempt = millis();
++  keyboardAddress = "";
++}
++
++std::string getCurrentDeviceAddress() {
++  return keyboardAddress;
++}
++
++// --- Multi-keyboard public API ---
++
++int getPairedKeyboardCount() {
++  return nvs_loadCount();
++}
++
++bool getPairedKeyboard(int index, std::string& addr, std::string& name, uint8_t& addrType) {
++  if (index < 0 || index >= nvs_loadCount()) return false;
++  addr = nvs_loadAddr(index);
++  name = nvs_loadName(index);
++  addrType = nvs_loadType(index);
++  return !addr.empty();
++}
++
++int getLastUsedKeyboardIndex() {
++  int count = nvs_loadCount();
++  if (count == 0) return -1;
++  int last = (int)prefs.getUChar("last_kb", 0);
++  return (last < count) ? last : 0;
++}
++
++bool removePairedKeyboard(int index) {
++  int count = nvs_loadCount();
++  if (index < 0 || index >= count) return false;
++
++  // Delete NimBLE bond for the keyboard being removed
++  std::string addr = nvs_loadAddr(index);
++  if (!addr.empty()) {
++    NimBLEDevice::deleteBond(NimBLEAddress(addr, nvs_loadType(index)));
++  }
++
++  // Shift remaining slots down
++  for (int i = index; i < count - 1; i++) {
++    nvs_saveKb(i, nvs_loadAddr(i + 1), nvs_loadName(i + 1), nvs_loadType(i + 1));
++  }
++  nvs_clearSlot(count - 1);
++  prefs.putUChar("kb_count", (uint8_t)(count - 1));
++
++  // Fix last_kb
++  int lastKb = (int)prefs.getUChar("last_kb", 0);
++  if (count - 1 == 0) {
++    prefs.remove("last_kb");
++  } else if (lastKb >= count - 1) {
++    prefs.putUChar("last_kb", 0);
++  } else if (lastKb > index) {
++    prefs.putUChar("last_kb", (uint8_t)(lastKb - 1));
++  }
++
++  // If this was the current connection, reset state
++  if (keyboardAddress == addr) {
++    if (pClient && pClient->isConnected()) pClient->disconnect();
++    keyboardAddress = "";
++  }
++
++  reconnectKeyboardIndex = 0;
++  DBG_PRINTF("[BLE] Removed paired keyboard slot %d (%s)\n", index, addr.c_str());
++  writeBleBackup();
++  return true;
++}
++
++void connectToPairedKeyboard(int index) {
++  int count = nvs_loadCount();
++  if (index < 0 || index >= count) return;
++
++  stopDeviceScan();
++  if (pClient && pClient->isConnected()) pClient->disconnect();
++
++  keyboardAddress = nvs_loadAddr(index);
++  keyboardAddressType = nvs_loadType(index);
++  prefs.putUChar("last_kb", (uint8_t)index);
++  reconnectKeyboardIndex = (count > 1) ? (index + 1) % count : 0;
++  reconnectDelay = 5000;
++  connectToKeyboard = true;
++  DBG_PRINTF("[BLE] Switching to paired keyboard %d: %s\n", index, keyboardAddress.c_str());
++  writeBleBackup();
++}
++
++void storePairedDevice(const std::string& address, const std::string& name) {
++  int count = nvs_loadCount();
++
++  // Update name if already stored
++  for (int i = 0; i < count; i++) {
++    if (nvs_loadAddr(i) == address) {
++      nvs_saveKb(i, address, name, keyboardAddressType);
++      prefs.putUChar("last_kb", (uint8_t)i);
++      DBG_PRINTF("[BLE] Updated paired keyboard slot %d: %s\n", i, name.c_str());
++      return;
++    }
++  }
++
++  int idx;
++  if (count < MAX_PAIRED_KEYBOARDS) {
++    idx = count;
++    prefs.putUChar("kb_count", (uint8_t)(count + 1));
++  } else {
++    // List full: evict slot 0 (oldest), shift everything down
++    for (int i = 0; i < MAX_PAIRED_KEYBOARDS - 1; i++) {
++      nvs_saveKb(i, nvs_loadAddr(i + 1), nvs_loadName(i + 1), nvs_loadType(i + 1));
++    }
++    idx = MAX_PAIRED_KEYBOARDS - 1;
++  }
++
++  nvs_saveKb(idx, address, name, keyboardAddressType);
++  prefs.putUChar("last_kb", (uint8_t)idx);
++  DBG_PRINTF("[BLE] Stored new paired keyboard slot %d: %s (%s)\n",
++             idx, name.c_str(), address.c_str());
++  writeBleBackup();
++}
++
++bool getStoredDevice(std::string& address, std::string& name) {
++  int idx = getLastUsedKeyboardIndex();
++  if (idx < 0) return false;
++  uint8_t addrType;
++  return getPairedKeyboard(idx, address, name, addrType);
++}
++
++bool isDeviceScanning() {
++  return isScanning;
++}
++
++uint32_t getScanAgeMs() {
++  return isScanning ? (millis() - scanStartMs) : 0;
++}
++
++void refreshScanNow() {
++  stopDeviceScan();
++  discoveredDevices.clear();
++  NimBLEDevice::getScan()->clearResults();
++  startDeviceScan();
++}
++
++void clearAllBluetoothBonds() {
++  NimBLEDevice::deleteAllBonds();
++  clearStoredDevice();
++  DBG_PRINTLN("[BLE] Deleted all bonds + cleared stored device");
++}
++
++void clearStoredDevice() {
++  int count = nvs_loadCount();
++  for (int i = 0; i < count; i++) nvs_clearSlot(i);
++  prefs.putUChar("kb_count", 0);
++  prefs.remove("last_kb");
++  NimBLEDevice::deleteAllBonds();
++  keyboardAddress = "";
++  reconnectKeyboardIndex = 0;
++  DBG_PRINTLN("[BLE] Cleared all paired keyboards and bonds");
++  writeBleBackup();
++}
+diff --git a/src/activities/notes/ble/ble_keyboard.h b/src/activities/notes/ble/ble_keyboard.h
+new file mode 100644
+index 0000000..5486daf
+--- /dev/null
++++ b/src/activities/notes/ble/ble_keyboard.h
+@@ -0,0 +1,55 @@
++#pragma once
++
++#include "ble_compat.h"
++#include <string>
++
++// Device info structure for discovered devices
++struct BleDeviceInfo {
++  std::string address;
++  std::string name;
++  int rssi;
++  uint8_t addressType;    // BLE address type (public/random)
++  uint32_t lastSeenMs;    // from millis()
++};
++
++void bleSetup();
++void bleLoop();
++bool isKeyboardConnected();
++BLEState getConnectionState();
++
++// Functions for Bluetooth device management
++void startDeviceScan();
++void stopDeviceScan();
++int getDiscoveredDeviceCount();
++BleDeviceInfo* getDiscoveredDevices();
++void connectToDevice(int deviceIndex);
++void disconnectCurrentDevice();
++std::string getCurrentDeviceAddress();
++
++// Global flag to control auto-reconnect behavior
++extern bool autoReconnectEnabled;
++
++// Max keyboards that can be stored
++static constexpr int MAX_PAIRED_KEYBOARDS = 4;
++
++// Multi-keyboard storage API
++int  getPairedKeyboardCount();
++bool getPairedKeyboard(int index, std::string& addr, std::string& name, uint8_t& addrType);
++int  getLastUsedKeyboardIndex();   // -1 if none stored
++bool removePairedKeyboard(int index);
++void connectToPairedKeyboard(int index);
++
++// Internal helpers (also used by ui_renderer for backwards compat)
++void storePairedDevice(const std::string& address, const std::string& name);
++bool getStoredDevice(std::string& address, std::string& name);
++void clearStoredDevice();
++
++// Function for getting current passkey for UI display
++uint32_t getCurrentPasskey();
++
++// Bluetooth scanning status functions
++bool isDeviceScanning();
++uint32_t getScanAgeMs();
++void refreshScanNow();
++void clearAllBluetoothBonds();
++void cancelPendingConnection();
+diff --git a/src/activities/notes/ble/dead_keys.h b/src/activities/notes/ble/dead_keys.h
+new file mode 100644
+index 0000000..f081e36
+--- /dev/null
++++ b/src/activities/notes/ble/dead_keys.h
+@@ -0,0 +1,193 @@
++#pragma once
++
++// ---------------------------------------------------------------------------
++// dead_keys.h — US-International dead key composition for MicroSlate
++//
++// Implements the five dead keys of the US-International layout:
++//   '  (apostrophe)  → acute accent   : a→á  e→é  i→í  o→ó  u→ú  c→ç
++//   `  (grave)       → grave accent   : a→à  e→è  i→ì  o→ò  u→ù
++//   ~  (tilde)       → tilde          : a→ã  o→õ  n→ñ
++//   ^  (circumflex)  → circumflex     : a→â  e→ê  i→î  o→ô  u→û
++//   "  (diaeresis)   → umlaut/trema   : a→ä  e→ë  i→ï  o→ö  u→ü
++//
++// Usage:
++//   const char* result = deadKeyProcess(ch);
++//   if (result == nullptr)  → insert `ch` normally (no dead key involved)
++//   if (result[0] == '\0')  → dead key stored; insert nothing now
++//   otherwise               → insert the UTF-8 string `result`
++//
++// When a dead key is followed by a non-composable character, the dead key
++// is emitted as a literal via deadKeyFlush(), and the original character
++// is returned via deadKeyPendingChar() for the caller to re-process.
++// ---------------------------------------------------------------------------
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// ---------------------------------------------------------------------------
++// Composition table
++// ---------------------------------------------------------------------------
++
++typedef struct {
++    char dead;
++    char base;
++    const char* result;  // UTF-8 encoded composed character
++} DeadKeyEntry;
++
++static const DeadKeyEntry DEAD_KEY_TABLE[] = {
++    // --- Acute accent  ' ---
++    { '\'', 'a', "\xC3\xA1" },  // á
++    { '\'', 'A', "\xC3\x81" },  // Á
++    { '\'', 'e', "\xC3\xA9" },  // é
++    { '\'', 'E', "\xC3\x89" },  // É
++    { '\'', 'i', "\xC3\xAD" },  // í
++    { '\'', 'I', "\xC3\x8D" },  // Í
++    { '\'', 'o', "\xC3\xB3" },  // ó
++    { '\'', 'O', "\xC3\x93" },  // Ó
++    { '\'', 'u', "\xC3\xBA" },  // ú
++    { '\'', 'U', "\xC3\x9A" },  // Ú
++    { '\'', 'c', "\xC3\xA7" },  // ç
++    { '\'', 'C', "\xC3\x87" },  // Ç
++    { '\'', ' ', "'"         },  // literal apostrophe
++
++    // --- Grave accent  ` ---
++    { '`',  'a', "\xC3\xA0" },  // à
++    { '`',  'A', "\xC3\x80" },  // À
++    { '`',  'e', "\xC3\xA8" },  // è
++    { '`',  'E', "\xC3\x88" },  // È
++    { '`',  'i', "\xC3\xAC" },  // ì
++    { '`',  'I', "\xC3\x8C" },  // Ì
++    { '`',  'o', "\xC3\xB2" },  // ò
++    { '`',  'O', "\xC3\x92" },  // Ò
++    { '`',  'u', "\xC3\xB9" },  // ù
++    { '`',  'U', "\xC3\x99" },  // Ù
++    { '`',  ' ', "`"         },  // literal grave
++
++    // --- Tilde  ~ ---
++    { '~',  'a', "\xC3\xA3" },  // ã
++    { '~',  'A', "\xC3\x83" },  // Ã
++    { '~',  'o', "\xC3\xB5" },  // õ
++    { '~',  'O', "\xC3\x95" },  // Õ
++    { '~',  'n', "\xC3\xB1" },  // ñ
++    { '~',  'N', "\xC3\x91" },  // Ñ
++    { '~',  ' ', "~"         },  // literal tilde
++
++    // --- Circumflex  ^ ---
++    { '^',  'a', "\xC3\xA2" },  // â
++    { '^',  'A', "\xC3\x82" },  // Â
++    { '^',  'e', "\xC3\xAA" },  // ê
++    { '^',  'E', "\xC3\x8A" },  // Ê
++    { '^',  'i', "\xC3\xAE" },  // î
++    { '^',  'I', "\xC3\x8E" },  // Î
++    { '^',  'o', "\xC3\xB4" },  // ô
++    { '^',  'O', "\xC3\x94" },  // Ô
++    { '^',  'u', "\xC3\xBB" },  // û
++    { '^',  'U', "\xC3\x9B" },  // Û
++    { '^',  ' ', "^"         },  // literal circumflex
++
++    // --- Diaeresis / Trema  " ---
++    { '"',  'a', "\xC3\xA4" },  // ä
++    { '"',  'A', "\xC3\x84" },  // Ä
++    { '"',  'e', "\xC3\xAB" },  // ë
++    { '"',  'E', "\xC3\x8B" },  // Ë
++    { '"',  'i', "\xC3\xAF" },  // ï
++    { '"',  'I', "\xC3\x8F" },  // Ï
++    { '"',  'o', "\xC3\xB6" },  // ö
++    { '"',  'O', "\xC3\x96" },  // Ö
++    { '"',  'u', "\xC3\xBC" },  // ü
++    { '"',  'U', "\xC3\x9C" },  // Ü
++    { '"',  ' ', "\""        },  // literal double-quote
++
++    { 0, 0, 0 }  // sentinel
++};
++
++// ---------------------------------------------------------------------------
++// State
++// ---------------------------------------------------------------------------
++
++static char  _dead_pending      = 0;   // the stored dead key, or 0
++static char  _dead_requeue_char = 0;   // char to reprocess after flush
++
++// ---------------------------------------------------------------------------
++// Public API
++// ---------------------------------------------------------------------------
++
++// Returns true if `ch` is one of the five dead keys.
++static inline bool deadKeyIsDeadChar(char ch) {
++    return ch == '\'' || ch == '`' || ch == '~' || ch == '^' || ch == '"';
++}
++
++// Returns true if there is a dead key waiting to be resolved.
++static inline bool deadKeyHasPending() {
++    return _dead_pending != 0;
++}
++
++// Returns the literal string for the pending dead key (so the caller can
++// emit it as-is before emitting the non-composable character).
++// Call only when deadKeyHasPending() is true.
++static inline const char* deadKeyFlush() {
++    static char buf[2];
++    buf[0] = _dead_pending;
++    buf[1] = '\0';
++    _dead_pending = 0;
++    return buf;
++}
++
++// After a flush, call this to retrieve the non-composable character that
++// originally triggered the flush (0 if none).
++static inline char deadKeyTakeRequeue() {
++    char c = _dead_requeue_char;
++    _dead_requeue_char = 0;
++    return c;
++}
++
++// Main entry point.  Call with each printable ASCII character as it arrives.
++//
++// Returns:
++//   nullptr  — no dead key involved; insert `ch` normally
++//   ""       — dead key stored; do not insert anything yet
++//   other    — UTF-8 string to insert (may be 1–3 bytes + NUL)
++//
++// When this returns a non-empty string AND deadKeyTakeRequeue() != 0,
++// the caller must also re-process the requeued character.
++static const char* deadKeyProcess(char ch) {
++    if (_dead_pending != 0) {
++        char dead = _dead_pending;
++        _dead_pending = 0;
++
++        // Search composition table
++        for (int i = 0; DEAD_KEY_TABLE[i].result != 0; i++) {
++            if (DEAD_KEY_TABLE[i].dead == dead && DEAD_KEY_TABLE[i].base == ch) {
++                return DEAD_KEY_TABLE[i].result;  // composed character
++            }
++        }
++
++        // No composition found: emit dead key as literal, requeue `ch`
++        static char flush_buf[2];
++        flush_buf[0] = dead;
++        flush_buf[1] = '\0';
++        _dead_requeue_char = ch;
++        return flush_buf;
++    }
++
++    if (deadKeyIsDeadChar(ch)) {
++        _dead_pending = ch;
++        return "";  // stored; nothing to insert now
++    }
++
++    return nullptr;  // normal character, insert as-is
++}
++
++// Reset dead key state (e.g. on ESC, focus change, or backspace logic).
++static inline void deadKeyReset() {
++    _dead_pending      = 0;
++    _dead_requeue_char = 0;
++}
++
++#ifdef __cplusplus
++}
++#endif
