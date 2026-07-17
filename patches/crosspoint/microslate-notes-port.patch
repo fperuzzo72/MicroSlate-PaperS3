@@ -1,0 +1,934 @@
+diff --git a/src/activities/notes/NoteEditor.cpp b/src/activities/notes/NoteEditor.cpp
+new file mode 100644
+index 0000000..f2b8497
+--- /dev/null
++++ b/src/activities/notes/NoteEditor.cpp
+@@ -0,0 +1,284 @@
++#include "NoteEditor.h"
++
++#include <algorithm>
++#include <cstring>
++
++void NoteEditor::clear() {
++  memset(textBuffer, 0, kBufferSize);
++  textLength = 0;
++  cursorPos = 0;
++  unsavedChanges = false;
++  viewportStartLine = 0;
++  lineBreaksDirty = true;
++  recalculateLines();
++}
++
++void NoteEditor::loadBuffer(size_t length) {
++  if (length >= kBufferSize) length = kBufferSize - 1;
++  textLength = length;
++  textBuffer[textLength] = '\0';
++  cursorPos = static_cast<int>(textLength);  // Start at end
++  viewportStartLine = 0;
++  lineBreaksDirty = true;
++  recalculateLines();
++  ensureCursorVisible();
++}
++
++void NoteEditor::recalculateLines() {
++  if (lineBreaksDirty) {
++    linePositions[0] = 0;
++    lines = 1;
++
++    int col = 0;
++    int lastSpace = -1;
++
++    for (int i = 0; i < static_cast<int>(textLength) && lines < kMaxLines; i++) {
++      if (textBuffer[i] == '\n') {
++        linePositions[lines] = i + 1;
++        lines++;
++        col = 0;
++        lastSpace = -1;
++        continue;
++      }
++
++      if (textBuffer[i] == ' ') {
++        lastSpace = i;
++      }
++
++      col++;
++      if (col >= charsPerLine) {
++        // Word wrap
++        int breakPos;
++        if (lastSpace > linePositions[lines - 1]) {
++          breakPos = lastSpace + 1;  // Break after space
++        } else {
++          breakPos = i + 1;  // Hard break mid-word
++        }
++
++        if (lines < kMaxLines) {
++          linePositions[lines] = breakPos;
++          lines++;
++        }
++        col = i + 1 - breakPos;
++        lastSpace = -1;
++      }
++    }
++    lineBreaksDirty = false;
++  }
++
++  // Compute cursor line and column (always — cheap O(cursorLine) with early exit)
++  curLine = 0;
++  for (int i = 1; i < lines; i++) {
++    if (cursorPos >= linePositions[i]) {
++      curLine = i;
++    } else {
++      break;
++    }
++  }
++  curCol = cursorPos - linePositions[curLine];
++}
++
++void NoteEditor::ensureCursorVisible() {
++  int visibleLines = storedVisibleLines;
++  if (visibleLines <= 0) visibleLines = 20;
++
++  if (curLine < viewportStartLine) {
++    viewportStartLine = curLine;
++  } else if (curLine >= viewportStartLine + visibleLines) {
++    viewportStartLine = curLine - visibleLines + 1;
++  }
++
++  if (viewportStartLine < 0) viewportStartLine = 0;
++  if (viewportStartLine >= lines) viewportStartLine = std::max(0, lines - 1);
++}
++
++int NoteEditor::wordCount() const {
++  int count = 0;
++  bool inWord = false;
++  for (size_t i = 0; i < textLength; i++) {
++    char c = textBuffer[i];
++    if (c == ' ' || c == '\n' || c == '\t' || c == '\r') {
++      inWord = false;
++    } else {
++      if (!inWord) {
++        count++;
++        inWord = true;
++      }
++    }
++  }
++  return count;
++}
++
++void NoteEditor::insertChar(char c) {
++  if (textLength >= kBufferSize - 1) return;
++
++  for (int i = static_cast<int>(textLength); i > cursorPos; i--) {
++    textBuffer[i] = textBuffer[i - 1];
++  }
++  textBuffer[cursorPos] = c;
++  cursorPos++;
++  textLength++;
++  textBuffer[textLength] = '\0';
++  unsavedChanges = true;
++  lineBreaksDirty = true;
++
++  recalculateLines();
++  ensureCursorVisible();
++}
++
++void NoteEditor::insertUtf8(const char* utf8str) {
++  if (!utf8str) return;
++  for (const char* p = utf8str; *p != '\0'; p++) {
++    insertChar(*p);
++  }
++}
++
++// Returns the number of bytes of the codepoint that *ends* at position pos-1.
++// Includes the fix from the accent work: walk back over continuation bytes
++// (10xxxxxx) at textBuffer[pos - len], not [pos - len - 1].
++int NoteEditor::utf8BackLen(int pos) const {
++  if (pos <= 0) return 0;
++  int len = 1;
++  while (len < 4 && (pos - len) > 0 &&
++         (static_cast<unsigned char>(textBuffer[pos - len]) & 0xC0) == 0x80) {
++    len++;
++  }
++  return len;
++}
++
++// Returns the number of bytes of the codepoint that *starts* at position pos.
++int NoteEditor::utf8FwdLen(int pos) const {
++  if (pos >= static_cast<int>(textLength)) return 0;
++  unsigned char c = static_cast<unsigned char>(textBuffer[pos]);
++  if (c < 0x80) return 1;
++  if ((c >> 5) == 0x6) return 2;
++  if ((c >> 4) == 0xE) return 3;
++  if ((c >> 3) == 0x1E) return 4;
++  return 1;  // fallback for stray continuation byte
++}
++
++void NoteEditor::deleteChar() {
++  if (cursorPos <= 0 || textLength == 0) return;
++
++  int len = utf8BackLen(cursorPos);
++  int newPos = cursorPos - len;
++
++  for (int i = newPos; i < static_cast<int>(textLength) - len; i++) {
++    textBuffer[i] = textBuffer[i + len];
++  }
++  cursorPos = newPos;
++  textLength -= len;
++  textBuffer[textLength] = '\0';
++  unsavedChanges = true;
++  lineBreaksDirty = true;
++
++  recalculateLines();
++  ensureCursorVisible();
++}
++
++void NoteEditor::deleteForward() {
++  if (cursorPos >= static_cast<int>(textLength)) return;
++
++  int len = utf8FwdLen(cursorPos);
++
++  for (int i = cursorPos; i < static_cast<int>(textLength) - len; i++) {
++    textBuffer[i] = textBuffer[i + len];
++  }
++  textLength -= len;
++  textBuffer[textLength] = '\0';
++  unsavedChanges = true;
++  lineBreaksDirty = true;
++
++  recalculateLines();
++  ensureCursorVisible();
++}
++
++void NoteEditor::moveCursorLeft() {
++  if (cursorPos > 0) {
++    cursorPos -= utf8BackLen(cursorPos);
++    recalculateLines();
++    ensureCursorVisible();
++  }
++}
++
++void NoteEditor::moveCursorRight() {
++  if (cursorPos < static_cast<int>(textLength)) {
++    cursorPos += utf8FwdLen(cursorPos);
++    recalculateLines();
++    ensureCursorVisible();
++  }
++}
++
++void NoteEditor::moveCursorUp() {
++  if (curLine <= 0) return;
++
++  int targetLine = curLine - 1;
++  int lineStart = linePositions[targetLine];
++  int lineEnd = (targetLine + 1 < lines) ? linePositions[targetLine + 1] : static_cast<int>(textLength);
++  int lineLen = lineEnd - lineStart;
++  if (lineLen > 0 && textBuffer[lineStart + lineLen - 1] == '\n') lineLen--;
++
++  cursorPos = lineStart + std::min(curCol, lineLen);
++  recalculateLines();
++  ensureCursorVisible();
++}
++
++void NoteEditor::moveCursorDown() {
++  if (curLine >= lines - 1) return;
++
++  int targetLine = curLine + 1;
++  int lineStart = linePositions[targetLine];
++  int lineEnd = (targetLine + 1 < lines) ? linePositions[targetLine + 1] : static_cast<int>(textLength);
++  int lineLen = lineEnd - lineStart;
++  if (lineLen > 0 && textBuffer[lineStart + lineLen - 1] == '\n') lineLen--;
++
++  cursorPos = lineStart + std::min(curCol, lineLen);
++  recalculateLines();
++  ensureCursorVisible();
++}
++
++void NoteEditor::moveCursorHome() {
++  cursorPos = linePositions[curLine];
++  recalculateLines();
++  ensureCursorVisible();
++}
++
++void NoteEditor::moveCursorEnd() {
++  int lineEnd;
++  if (curLine + 1 < lines) {
++    lineEnd = linePositions[curLine + 1];
++    if (lineEnd > 0 && textBuffer[lineEnd - 1] == '\n') lineEnd--;
++  } else {
++    lineEnd = static_cast<int>(textLength);
++  }
++  cursorPos = lineEnd;
++  recalculateLines();
++  ensureCursorVisible();
++}
++
++void NoteEditor::setCharsPerLine(int cpl) {
++  if (cpl != charsPerLine) {
++    charsPerLine = cpl;
++    lineBreaksDirty = true;
++  }
++  recalculateLines();
++}
++
++void NoteEditor::setVisibleLines(int n) {
++  if (n > 0) storedVisibleLines = n;
++}
++
++int NoteEditor::linePosition(int lineIndex) const {
++  if (lineIndex < 0 || lineIndex >= lines) return 0;
++  return linePositions[lineIndex];
++}
++
++void NoteEditor::setCurrentFile(const char* filename) {
++  strncpy(currentFileName, filename, kMaxFilenameLen - 1);
++  currentFileName[kMaxFilenameLen - 1] = '\0';
++}
++
++void NoteEditor::setCurrentTitle(const char* title) {
++  strncpy(currentTitleStr, title, kMaxTitleLen - 1);
++  currentTitleStr[kMaxTitleLen - 1] = '\0';
++}
+diff --git a/src/activities/notes/NoteEditor.h b/src/activities/notes/NoteEditor.h
+new file mode 100644
+index 0000000..aa490b6
+--- /dev/null
++++ b/src/activities/notes/NoteEditor.h
+@@ -0,0 +1,77 @@
++#pragma once
++#include <cstddef>
++
++// MicroSlate's text-editor core, ported from microslate-firmware
++// src/text_editor.cpp (including our UTF-8 backspace/forward-delete fixes and
++// editorInsertUtf8, both from the US-International accent work). Converted
++// from file-scope statics to a class so it can live inside an Activity
++// without global state; the algorithms are unchanged on purpose — they're
++// hardware-independent and already field-tested on the X4.
++class NoteEditor {
++ public:
++  static constexpr size_t kBufferSize = 16384;
++  static constexpr int kMaxLines = 1024;
++  static constexpr int kMaxTitleLen = 40;
++  static constexpr int kMaxFilenameLen = 64;
++
++  NoteEditor() { clear(); }
++
++  void clear();
++  // After filling buffer() externally, set length + move cursor to end
++  void loadBuffer(size_t length);
++
++  char* buffer() { return textBuffer; }
++  size_t length() const { return textLength; }
++  int cursorPosition() const { return cursorPos; }
++  int wordCount() const;
++
++  void insertChar(char c);
++  void insertUtf8(const char* utf8str);
++  void deleteChar();     // Backspace (UTF-8 aware)
++  void deleteForward();  // Delete key (UTF-8 aware)
++
++  void moveCursorLeft();
++  void moveCursorRight();
++  void moveCursorUp();
++  void moveCursorDown();
++  void moveCursorHome();
++  void moveCursorEnd();
++
++  void setCharsPerLine(int cpl);
++  void setVisibleLines(int n);
++  int viewportStart() const { return viewportStartLine; }
++  int cursorLine() const { return curLine; }
++  int cursorCol() const { return curCol; }
++  int lineCount() const { return lines; }
++  int linePosition(int lineIndex) const;
++
++  void setCurrentFile(const char* filename);
++  void setCurrentTitle(const char* title);
++  const char* currentFile() const { return currentFileName; }
++  const char* currentTitle() const { return currentTitleStr; }
++  bool hasUnsavedChanges() const { return unsavedChanges; }
++  void setUnsavedChanges(bool v) { unsavedChanges = v; }
++
++ private:
++  void recalculateLines();
++  void ensureCursorVisible();
++  int utf8BackLen(int pos) const;
++  int utf8FwdLen(int pos) const;
++
++  char textBuffer[kBufferSize];
++  size_t textLength = 0;
++  int cursorPos = 0;
++
++  char currentFileName[kMaxFilenameLen] = "";
++  char currentTitleStr[kMaxTitleLen] = "Untitled";
++  bool unsavedChanges = false;
++
++  int linePositions[kMaxLines];
++  int lines = 0;
++  int curLine = 0;
++  int curCol = 0;
++  int viewportStartLine = 0;
++  int charsPerLine = 40;
++  int storedVisibleLines = 20;
++  bool lineBreaksDirty = true;
++};
+diff --git a/src/activities/notes/NoteEditorActivity.cpp b/src/activities/notes/NoteEditorActivity.cpp
+new file mode 100644
+index 0000000..5f82b15
+--- /dev/null
++++ b/src/activities/notes/NoteEditorActivity.cpp
+@@ -0,0 +1,159 @@
++#include "NoteEditorActivity.h"
++
++#include <GfxRenderer.h>
++
++#include <cstdio>
++#include <cstring>
++
++#include "components/UITheme.h"
++#include "fontIds.h"
++
++namespace {
++// Editor body font. UI_10 keeps ~40+ chars per line in portrait — close to
++// MicroSlate's own default and comfortable for notes.
++constexpr int kEditorFontId = UI_10_FONT_ID;
++}  // namespace
++
++void NoteEditorActivity::startNew(NoteStore& store) {
++  noteStore = &store;
++  isNew = true;
++}
++
++void NoteEditorActivity::startExisting(NoteStore& store, const char* filename) {
++  noteStore = &store;
++  isNew = false;
++  strncpy(pendingFilename, filename, sizeof(pendingFilename) - 1);
++  pendingFilename[sizeof(pendingFilename) - 1] = '\0';
++}
++
++void NoteEditorActivity::onEnter() {
++  Activity::onEnter();
++
++  loadFailed = false;
++  if (noteStore) {
++    if (isNew) {
++      noteStore->createNewFile(editor);
++    } else {
++      loadFailed = !noteStore->loadFile(pendingFilename, editor);
++    }
++  } else {
++    loadFailed = true;
++  }
++
++  // charsPerLine from real font metrics (MicroSlate sampled average glyph
++  // width the same way)
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const int usableWidth = renderer.getScreenWidth() - metrics.contentSidePadding * 2;
++  const int avgCharWidth = renderer.getTextWidth(kEditorFontId, "n");
++  editor.setCharsPerLine(avgCharWidth > 0 ? usableWidth / avgCharWidth : 40);
++
++  requestUpdateAndWait();
++}
++
++void NoteEditorActivity::onExit() {
++  // Autosave on the way out — MicroSlate's behavior; a note with unsaved
++  // changes should never be silently lost to a Back press.
++  if (noteStore && editor.hasUnsavedChanges() && editor.length() > 0) {
++    noteStore->saveCurrentFile(editor);
++  }
++  Activity::onExit();
++}
++
++void NoteEditorActivity::loop() {
++  if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
++    finish();  // onExit autosaves
++    return;
++  }
++
++  bool changed = false;
++  // Content-zone horizontal gestures move the cursor (keyboard arrives with
++  // the BLE port; these stay useful afterwards for quick repositioning).
++  if (mappedInput.wasReleased(MappedInputManager::Button::Left)) {
++    editor.moveCursorLeft();
++    changed = true;
++  }
++  if (mappedInput.wasReleased(MappedInputManager::Button::Right)) {
++    editor.moveCursorRight();
++    changed = true;
++  }
++  if (mappedInput.wasReleased(MappedInputManager::Button::Up)) {
++    editor.moveCursorUp();
++    changed = true;
++  }
++  if (mappedInput.wasReleased(MappedInputManager::Button::Down)) {
++    editor.moveCursorDown();
++    changed = true;
++  }
++
++  if (changed) requestUpdate();
++}
++
++void NoteEditorActivity::render(RenderLock&&) {
++  renderer.clearScreen();
++
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const auto pageWidth = renderer.getScreenWidth();
++  const auto pageHeight = renderer.getScreenHeight();
++
++  // Header: title + unsaved marker + word count
++  char headerBuf[64];
++  snprintf(headerBuf, sizeof(headerBuf), "%s%s", editor.currentTitle(),
++           editor.hasUnsavedChanges() ? " *" : "");
++  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, headerBuf);
++
++  const int textTop = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
++  const int textBottom = pageHeight - metrics.buttonHintsHeight - metrics.verticalSpacing;
++  const int lineHeight = renderer.getLineHeight(kEditorFontId);
++  const int visibleLines = (textBottom - textTop) / lineHeight;
++  editor.setVisibleLines(visibleLines);
++
++  if (loadFailed) {
++    renderer.drawText(kEditorFontId, metrics.contentSidePadding, textTop, "Could not load note.");
++  } else {
++    const char* buf = editor.buffer();
++    const int vpStart = editor.viewportStart();
++    const int totalLines = editor.lineCount();
++
++    char lineBuf[256];
++    for (int i = 0; i < visibleLines && (vpStart + i) < totalLines; i++) {
++      const int lineIdx = vpStart + i;
++      const int start = editor.linePosition(lineIdx);
++      const int end =
++          (lineIdx + 1 < totalLines) ? editor.linePosition(lineIdx + 1) : static_cast<int>(editor.length());
++      int len = end - start;
++      if (len > 0 && buf[start + len - 1] == '\n') len--;
++      if (len > static_cast<int>(sizeof(lineBuf)) - 1) len = sizeof(lineBuf) - 1;
++      memcpy(lineBuf, buf + start, len);
++      lineBuf[len] = '\0';
++
++      const int yPos = textTop + i * lineHeight;
++      if (len > 0) {
++        renderer.drawText(kEditorFontId, metrics.contentSidePadding, yPos, lineBuf);
++      }
++
++      // Cursor: thin vertical bar at the cursor column of the cursor line
++      if (lineIdx == editor.cursorLine()) {
++        int col = editor.cursorCol();
++        if (col > len) col = len;
++        char tmp = lineBuf[col];
++        lineBuf[col] = '\0';
++        const int cursorX = metrics.contentSidePadding + renderer.getTextWidth(kEditorFontId, lineBuf);
++        lineBuf[col] = tmp;
++        renderer.fillRect(cursorX, yPos, 2, lineHeight - 2);
++      }
++    }
++
++    // Empty note hint
++    if (editor.length() == 0) {
++      renderer.drawText(kEditorFontId, metrics.contentSidePadding, textTop + lineHeight * 2,
++                        "Empty note. Text entry arrives with the");
++      renderer.drawText(kEditorFontId, metrics.contentSidePadding, textTop + lineHeight * 3,
++                        "BLE keyboard port (next step).");
++    }
++  }
++
++  const auto labels = mappedInput.mapLabels("Back", "", "", "");
++  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
++
++  renderer.displayBuffer();
++}
+diff --git a/src/activities/notes/NoteEditorActivity.h b/src/activities/notes/NoteEditorActivity.h
+new file mode 100644
+index 0000000..af7c5e7
+--- /dev/null
++++ b/src/activities/notes/NoteEditorActivity.h
+@@ -0,0 +1,36 @@
++#pragma once
++#include "../Activity.h"
++#include "NoteEditor.h"
++#include "NoteStore.h"
++
++// MicroSlate's editor screen as a CrossPoint Activity: renders the note
++// buffer with word wrap and a visible cursor, autosaves on exit.
++//
++// Input today is touch-only (footer Confirm/Back + content-zone Left/Right
++// for cursor movement). Text ENTRY requires the BLE keyboard subsystem
++// (MicroSlate's ble_keyboard.cpp + input_handler.cpp with the
++// US-International dead-key support) which is NOT ported yet — see the
++// keyboard section in docs/crosspoint-papers3-sync-plan.md. The editor core
++// (NoteEditor) already exposes insertUtf8()/deleteChar()/etc. for it to
++// plug into, so the keyboard port is additive: nothing here changes.
++class NoteEditorActivity final : public Activity {
++ public:
++  explicit NoteEditorActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
++      : Activity("NoteEditor", renderer, mappedInput) {}
++
++  // Call exactly one of these before the activity is pushed:
++  void startNew(NoteStore& store);
++  void startExisting(NoteStore& store, const char* filename);
++
++  void onEnter() override;
++  void onExit() override;
++  void loop() override;
++  void render(RenderLock&&) override;
++
++ private:
++  NoteStore* noteStore = nullptr;
++  NoteEditor editor;
++  bool loadFailed = false;
++  char pendingFilename[NoteEditor::kMaxFilenameLen] = "";
++  bool isNew = false;
++};
+diff --git a/src/activities/notes/NoteStore.cpp b/src/activities/notes/NoteStore.cpp
+new file mode 100644
+index 0000000..9c2ce69
+--- /dev/null
++++ b/src/activities/notes/NoteStore.cpp
+@@ -0,0 +1,140 @@
++#include "NoteStore.h"
++
++#include <HalStorage.h>
++
++#include <cstdio>
++#include <cstring>
++
++bool NoteStore::begin() {
++  if (!Storage.ready()) return false;
++  return Storage.ensureDirectoryExists(kNotesDir);
++}
++
++void NoteStore::deriveTitleFromContent(const char* buf, size_t len, char* out, int maxLen) const {
++  // Same rule as MicroSlate: the first line of content is the display title.
++  int outIdx = 0;
++  for (size_t i = 0; i < len && outIdx < maxLen - 1; i++) {
++    if (buf[i] == '\n' || buf[i] == '\r') break;
++    out[outIdx++] = buf[i];
++  }
++  out[outIdx] = '\0';
++  if (outIdx == 0) {
++    strncpy(out, "Untitled", maxLen - 1);
++    out[maxLen - 1] = '\0';
++  }
++}
++
++void NoteStore::refreshFileList() {
++  count = 0;
++  auto dir = Storage.open(kNotesDir);
++  if (!dir || !dir.isDirectory()) return;
++
++  for (auto file = dir.openNextFile(); file && count < kMaxFiles; file = dir.openNextFile()) {
++    if (file.isDirectory()) continue;
++
++    char name[NoteEditor::kMaxFilenameLen];
++    file.getName(name, sizeof(name));
++
++    // Only .txt files; skip temp files from interrupted saves
++    const size_t nameLen = strlen(name);
++    if (nameLen < 4 || strcmp(name + nameLen - 4, ".txt") != 0) continue;
++    if (name[0] == '~') continue;
++
++    strncpy(files[count].filename, name, NoteEditor::kMaxFilenameLen - 1);
++    files[count].filename[NoteEditor::kMaxFilenameLen - 1] = '\0';
++
++    // Read the first line for the title
++    char firstLine[NoteEditor::kMaxTitleLen] = {0};
++    const int bytesRead = file.read(firstLine, sizeof(firstLine) - 1);
++    deriveTitleFromContent(firstLine, bytesRead > 0 ? bytesRead : 0, files[count].title,
++                           NoteEditor::kMaxTitleLen);
++    count++;
++  }
++}
++
++bool NoteStore::loadFile(const char* filename, NoteEditor& editor) {
++  char path[96];
++  snprintf(path, sizeof(path), "%s/%s", kNotesDir, filename);
++
++  editor.clear();
++  const size_t bytesRead = Storage.readFileToBuffer(path, editor.buffer(), NoteEditor::kBufferSize);
++  editor.loadBuffer(bytesRead);
++  editor.setCurrentFile(filename);
++
++  char title[NoteEditor::kMaxTitleLen];
++  deriveTitleFromContent(editor.buffer(), editor.length(), title, sizeof(title));
++  editor.setCurrentTitle(title);
++  editor.setUnsavedChanges(false);
++  return true;
++}
++
++bool NoteStore::saveCurrentFile(NoteEditor& editor) {
++  const char* filename = editor.currentFile();
++  if (filename[0] == '\0') return false;
++
++  char tmpPath[96];
++  char finalPath[96];
++  snprintf(tmpPath, sizeof(tmpPath), "%s/~%s", kNotesDir, filename);
++  snprintf(finalPath, sizeof(finalPath), "%s/%s", kNotesDir, filename);
++
++  // Write to temp first (crash safety — same pattern as MicroSlate's
++  // saveCurrentFile), then rename over the real file.
++  {
++    auto tmp = Storage.open(tmpPath, O_WRONLY | O_CREAT | O_TRUNC);
++    if (!tmp) return false;
++    const size_t toWrite = editor.length();
++    const size_t written = tmp.write(editor.buffer(), toWrite);
++    tmp.close();
++    if (written != toWrite) {
++      Storage.remove(tmpPath);
++      return false;
++    }
++  }
++
++  Storage.remove(finalPath);  // rename() won't overwrite on FAT
++  {
++    auto tmp = Storage.open(tmpPath, O_RDONLY);
++    if (!tmp) return false;
++    if (!tmp.rename(finalPath)) {
++      tmp.close();
++      return false;
++    }
++    tmp.close();
++  }
++
++  // Title may have changed with the first line
++  char title[NoteEditor::kMaxTitleLen];
++  deriveTitleFromContent(editor.buffer(), editor.length(), title, sizeof(title));
++  editor.setCurrentTitle(title);
++  editor.setUnsavedChanges(false);
++  refreshFileList();
++  return true;
++}
++
++void NoteStore::createNewFile(NoteEditor& editor) {
++  // Derive a unique note_N.txt filename not present in the current list
++  char candidate[NoteEditor::kMaxFilenameLen];
++  for (int n = 1; n < 1000; n++) {
++    snprintf(candidate, sizeof(candidate), "note_%d.txt", n);
++    bool taken = false;
++    for (int i = 0; i < count; i++) {
++      if (strcmp(files[i].filename, candidate) == 0) {
++        taken = true;
++        break;
++      }
++    }
++    if (!taken) break;
++  }
++
++  editor.clear();
++  editor.setCurrentFile(candidate);
++  editor.setCurrentTitle("Untitled");
++}
++
++bool NoteStore::deleteFile(const char* filename) {
++  char path[96];
++  snprintf(path, sizeof(path), "%s/%s", kNotesDir, filename);
++  const bool ok = Storage.remove(path);
++  if (ok) refreshFileList();
++  return ok;
++}
+diff --git a/src/activities/notes/NoteStore.h b/src/activities/notes/NoteStore.h
+new file mode 100644
+index 0000000..759772b
+--- /dev/null
++++ b/src/activities/notes/NoteStore.h
+@@ -0,0 +1,41 @@
++#pragma once
++#include <cstddef>
++
++#include "NoteEditor.h"
++
++// MicroSlate's note file management (src/file_manager.cpp) ported onto
++// CrossPoint's HalStorage. Notes are plain .txt files in /notes on the SD
++// card — same on-disk format as standalone MicroSlate on the X4 (first line
++// used as the display title), so a card moved between devices keeps working.
++class NoteStore {
++ public:
++  static constexpr int kMaxFiles = 50;
++  static constexpr const char* kNotesDir = "/notes";
++
++  struct FileInfo {
++    char filename[NoteEditor::kMaxFilenameLen];
++    char title[NoteEditor::kMaxTitleLen];
++  };
++
++  // Ensure /notes exists; returns false if the SD card isn't usable.
++  bool begin();
++  void refreshFileList();
++  int fileCount() const { return count; }
++  const FileInfo& file(int index) const { return files[index]; }
++
++  // Load note contents into the editor. Returns false on read failure.
++  bool loadFile(const char* filename, NoteEditor& editor);
++  // Save the editor's buffer to its current file (write-to-temp + rename,
++  // same crash-safety pattern as MicroSlate's saveCurrentFile).
++  bool saveCurrentFile(NoteEditor& editor);
++  // Start a new note in the editor with a unique filename (not yet on disk
++  // until first save).
++  void createNewFile(NoteEditor& editor);
++  bool deleteFile(const char* filename);
++
++ private:
++  void deriveTitleFromContent(const char* buf, size_t len, char* out, int maxLen) const;
++
++  FileInfo files[kMaxFiles];
++  int count = 0;
++};
+diff --git a/src/activities/notes/NotesActivity.cpp b/src/activities/notes/NotesActivity.cpp
+index 3131df0..f9c233f 100644
+--- a/src/activities/notes/NotesActivity.cpp
++++ b/src/activities/notes/NotesActivity.cpp
+@@ -2,21 +2,72 @@
+ 
+ #include <GfxRenderer.h>
+ 
++#include "../ActivityManager.h"
++#include "NoteEditorActivity.h"
+ #include "components/UITheme.h"
+ #include "fontIds.h"
+ 
+-// TODO(microslate-port): this is a scaffold, not the ported editor. Replace
+-// loop()/render() with the real MicroSlate note editor (text buffer, file
+-// browser for notes, keyboard input handling) once ported. The class name,
+-// constructor, and the HomeActivity/ActivityManager wiring around it are
+-// meant to stay as-is — only the body changes.
+-
+ void NotesActivity::onEnter() {
+   Activity::onEnter();
++  storageOk = store.begin();
++  if (storageOk) store.refreshFileList();
++  selectorIndex = 0;
++  deleteConfirmPending = false;
+   requestUpdateAndWait();
+ }
+ 
++void NotesActivity::openSelected() {
++  auto editorActivity = std::make_unique<NoteEditorActivity>(renderer, mappedInput);
++  if (selectorIndex == 0) {
++    editorActivity->startNew(store);
++  } else {
++    editorActivity->startExisting(store, store.file(selectorIndex - 1).filename);
++  }
++  // Push (not replace) so Back in the editor returns to this list with its
++  // state intact; the result handler refreshes the list since the editor may
++  // have created/renamed/saved a note.
++  startActivityForResult(std::move(editorActivity), [this](const ActivityResult&) {
++    store.refreshFileList();
++    if (selectorIndex > store.fileCount()) selectorIndex = store.fileCount();
++  });
++}
++
+ void NotesActivity::loop() {
++  const int itemCount = 1 + store.fileCount();  // "+ New note" + files
++
++  buttonNavigator.onNext([this, itemCount] {
++    selectorIndex = ButtonNavigator::nextIndex(selectorIndex, itemCount);
++    deleteConfirmPending = false;
++    requestUpdate();
++  });
++
++  buttonNavigator.onPrevious([this, itemCount] {
++    selectorIndex = ButtonNavigator::previousIndex(selectorIndex, itemCount);
++    deleteConfirmPending = false;
++    requestUpdate();
++  });
++
++  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
++    if (!storageOk) return;
++    openSelected();
++    return;
++  }
++
++  // Hold-to-delete pattern: PageBack (left content zone / long-press
++  // substitute) asks for confirmation, Confirm within the prompt deletes.
++  if (selectorIndex > 0 && mappedInput.wasReleased(MappedInputManager::Button::Left)) {
++    deleteConfirmPending = !deleteConfirmPending;
++    requestUpdate();
++    return;
++  }
++  if (deleteConfirmPending && mappedInput.wasReleased(MappedInputManager::Button::Right)) {
++    store.deleteFile(store.file(selectorIndex - 1).filename);
++    if (selectorIndex > store.fileCount()) selectorIndex = store.fileCount();
++    deleteConfirmPending = false;
++    requestUpdate();
++    return;
++  }
++
+   if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+     onGoHome();
+   }
+@@ -27,20 +78,29 @@ void NotesActivity::render(RenderLock&&) {
+ 
+   const auto& metrics = UITheme::getInstance().getMetrics();
+   const auto pageWidth = renderer.getScreenWidth();
++  const auto pageHeight = renderer.getScreenHeight();
+ 
+   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, "Notes");
+ 
+-  const auto lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
+-  int y = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing * 3;
+-  const auto x = metrics.contentSidePadding;
++  const int listTop = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
++  const int listHeight = pageHeight - listTop - metrics.buttonHintsHeight - metrics.verticalSpacing;
+ 
+-  renderer.drawText(UI_10_FONT_ID, x, y, "MicroSlate note editor — not ported yet.");
+-  y += lineHeight * 2;
+-  renderer.drawText(UI_10_FONT_ID, x, y, "This screen is a placeholder so the");
+-  y += lineHeight;
+-  renderer.drawText(UI_10_FONT_ID, x, y, "menu structure exists ahead of the port.");
++  if (!storageOk) {
++    renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, listTop, "SD card not available.");
++  } else {
++    const int itemCount = 1 + store.fileCount();
++    GUI.drawList(
++        renderer, Rect{0, listTop, pageWidth, listHeight}, itemCount, selectorIndex,
++        [this](int index) -> std::string {
++          if (index == 0) return "+ New note";
++          return std::string(store.file(index - 1).title);
++        },
++        nullptr, nullptr);
++  }
+ 
+-  const auto labels = mappedInput.mapLabels("Back", "", "", "");
++  const char* confirmLabel = deleteConfirmPending ? "Delete!" : "Open";
++  const auto labels =
++      mappedInput.mapLabels("Back", confirmLabel, deleteConfirmPending ? "Cancel" : "Del", "");
+   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+ 
+   renderer.displayBuffer();
+diff --git a/src/activities/notes/NotesActivity.h b/src/activities/notes/NotesActivity.h
+index 826b9c8..b8c6c96 100644
+--- a/src/activities/notes/NotesActivity.h
++++ b/src/activities/notes/NotesActivity.h
+@@ -1,12 +1,14 @@
+ #pragma once
++#include <memory>
++
+ #include "../Activity.h"
++#include "NoteStore.h"
++#include "util/ButtonNavigator.h"
+ 
+-// Placeholder for the ported MicroSlate note editor. Scaffolding only —
+-// grouped under "MicroSlate" in HomeActivity's menu, reachable, and returns
+-// home on Back — but doesn't edit anything yet. The real port (text buffer,
+-// file browser for notes, the touch/keyboard input handling we already
+-// built for standalone MicroSlate) replaces this render()/loop() body in
+-// place; the class and the menu wiring around it don't need to change.
++// MicroSlate's note list, as a CrossPoint Activity. Browses /notes on the
++// SD card; Confirm opens the selected note in NoteEditorActivity, and the
++// first row is always "+ New note". Long-term home of MicroSlate inside the
++// unified PaperOS build (see docs/crosspoint-papers3-sync-plan.md).
+ class NotesActivity final : public Activity {
+  public:
+   explicit NotesActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
+@@ -14,4 +16,13 @@ class NotesActivity final : public Activity {
+   void onEnter() override;
+   void loop() override;
+   void render(RenderLock&&) override;
++
++ private:
++  ButtonNavigator buttonNavigator;
++  NoteStore store;
++  bool storageOk = false;
++  int selectorIndex = 0;  // 0 = "+ New note", 1..fileCount = notes
++  bool deleteConfirmPending = false;
++
++  void openSelected();
+ };

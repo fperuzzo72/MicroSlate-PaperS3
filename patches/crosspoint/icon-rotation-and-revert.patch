@@ -1,0 +1,101 @@
+diff --git a/lib/GfxRenderer/GfxRenderer.cpp b/lib/GfxRenderer/GfxRenderer.cpp
+index 1a3cc67..2881471 100644
+--- a/lib/GfxRenderer/GfxRenderer.cpp
++++ b/lib/GfxRenderer/GfxRenderer.cpp
+@@ -624,6 +624,45 @@ void GfxRenderer::drawImage(const uint8_t bitmap[], const int x, const int y, co
+   display.drawImage(bitmap, rotatedX, rotatedY, width, height);
+ }
+ 
++namespace {
++// Icons are packed 1bpp, MSB-first, row-major (bit=0 -> black, bit=1 ->
++// transparent — see HalDisplay::drawImageTransparent). Largest icon in use
++// today is 32x32 = 128 bytes; bump this if a larger one gets added.
++constexpr size_t kMaxIconBitmapBytes = 256;
++
++// Rotate a packed 1bpp bitmap 180°. Needed because drawImageTransparent()
++// blits pixel data exactly as stored — only the *position* it's placed at
++// is orientation-aware (via rotateCoordinates()), not the pixel content
++// itself. Portrait and PortraitInverted are 180° different mappings onto
++// the physical (landscape) panel; these icon assets were authored assuming
++// the Portrait mapping, so under PortraitInverted they need their content
++// rotated to still read right-side-up.
++bool rotateBitmap180(const uint8_t* src, uint8_t* dst, int width, int height) {
++  const int rowBytes = width / 8;
++  const size_t totalBytes = static_cast<size_t>(rowBytes) * height;
++  if (rowBytes == 0 || totalBytes > kMaxIconBitmapBytes) return false;
++
++  memset(dst, 0xFF, totalBytes);  // 1 = transparent by default
++
++  for (int y = 0; y < height; y++) {
++    for (int x = 0; x < width; x++) {
++      const int srcByteIdx = y * rowBytes + x / 8;
++      const int srcBit = 7 - (x % 8);
++      const uint8_t srcByte = src[srcByteIdx];
++      const bool isBlack = !((srcByte >> srcBit) & 1);
++      if (!isBlack) continue;
++
++      const int dx = width - 1 - x;
++      const int dy = height - 1 - y;
++      const int dstByteIdx = dy * rowBytes + dx / 8;
++      const int dstBit = 7 - (dx % 8);
++      dst[dstByteIdx] &= ~(1 << dstBit);
++    }
++  }
++  return true;
++}
++}  // namespace
++
+ void GfxRenderer::drawIcon(const uint8_t bitmap[], const int x, const int y, const int width, const int height) const {
+   // Previously hardcoded for Portrait only (phyX=y, phyY=getScreenWidth()-width-x),
+   // which is why this broke silently the moment the default orientation
+@@ -634,12 +673,19 @@ void GfxRenderer::drawIcon(const uint8_t bitmap[], const int x, const int y, con
+   int rotatedX = 0;
+   int rotatedY = 0;
+   rotateCoordinates(orientation, x, y, &rotatedX, &rotatedY);
++
++  const uint8_t* bitsToDraw = bitmap;
++  uint8_t rotatedBitmap[kMaxIconBitmapBytes];
++
+   switch (orientation) {
+     case Portrait:
+       rotatedY = rotatedY - height;
+       break;
+     case PortraitInverted:
+       rotatedX = rotatedX - width;
++      if (rotateBitmap180(bitmap, rotatedBitmap, width, height)) {
++        bitsToDraw = rotatedBitmap;
++      }
+       break;
+     case LandscapeClockwise:
+       rotatedY = rotatedY - height;
+@@ -648,7 +694,7 @@ void GfxRenderer::drawIcon(const uint8_t bitmap[], const int x, const int y, con
+     case LandscapeCounterClockwise:
+       break;
+   }
+-  display.drawImageTransparent(bitmap, rotatedX, rotatedY, width, height);
++  display.drawImageTransparent(bitsToDraw, rotatedX, rotatedY, width, height);
+ }
+ 
+ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, const int maxWidth, const int maxHeight,
+diff --git a/src/activities/home/HomeActivity.cpp b/src/activities/home/HomeActivity.cpp
+index f797bb3..6d9d381 100644
+--- a/src/activities/home/HomeActivity.cpp
++++ b/src/activities/home/HomeActivity.cpp
+@@ -226,17 +226,6 @@ void HomeActivity::render(RenderLock&&) {
+   renderer.clearScreen();
+   bool bufferRestored = coverBufferStored && restoreCoverBuffer();
+ 
+-  if (bufferRestored) {
+-    // restoreCoverBuffer() just pasted back a full-frame snapshot that may
+-    // have an older header/battery baked into it (captured whenever
+-    // storeCoverBuffer() last ran, inside drawRecentBookCover() below).
+-    // drawHeader()'s own battery clear-rect is scoped to redrawing over
+-    // itself frame-to-frame, not to erasing a stale header pasted back in
+-    // from an older stored snapshot — clear the whole header strip first so
+-    // nothing from that snapshot survives under the fresh draw.
+-    renderer.fillRect(0, metrics.topPadding, pageWidth, metrics.homeTopPadding, false);
+-  }
+-
+   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.homeTopPadding}, nullptr);
+ 
+   GUI.drawRecentBookCover(renderer, Rect{0, metrics.homeTopPadding, pageWidth, metrics.homeCoverTileHeight},

@@ -1,0 +1,64 @@
+diff --git a/lib/GfxRenderer/GfxRenderer.cpp b/lib/GfxRenderer/GfxRenderer.cpp
+index 9b7149b..1a3cc67 100644
+--- a/lib/GfxRenderer/GfxRenderer.cpp
++++ b/lib/GfxRenderer/GfxRenderer.cpp
+@@ -625,7 +625,30 @@ void GfxRenderer::drawImage(const uint8_t bitmap[], const int x, const int y, co
+ }
+ 
+ void GfxRenderer::drawIcon(const uint8_t bitmap[], const int x, const int y, const int width, const int height) const {
+-  display.drawImageTransparent(bitmap, y, getScreenWidth() - width - x, height, width);
++  // Previously hardcoded for Portrait only (phyX=y, phyY=getScreenWidth()-width-x),
++  // which is why this broke silently the moment the default orientation
++  // became PortraitInverted — icons were still being placed as if the
++  // screen were Portrait. Route through the same rotateCoordinates() +
++  // origin-corner adjustment drawImage() already uses, so this works for
++  // all four orientations instead of just the one it happened to be tested in.
++  int rotatedX = 0;
++  int rotatedY = 0;
++  rotateCoordinates(orientation, x, y, &rotatedX, &rotatedY);
++  switch (orientation) {
++    case Portrait:
++      rotatedY = rotatedY - height;
++      break;
++    case PortraitInverted:
++      rotatedX = rotatedX - width;
++      break;
++    case LandscapeClockwise:
++      rotatedY = rotatedY - height;
++      rotatedX = rotatedX - width;
++      break;
++    case LandscapeCounterClockwise:
++      break;
++  }
++  display.drawImageTransparent(bitmap, rotatedX, rotatedY, width, height);
+ }
+ 
+ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, const int maxWidth, const int maxHeight,
+diff --git a/src/activities/notes/NotesActivity.cpp b/src/activities/notes/NotesActivity.cpp
+index 2e32cee..3131df0 100644
+--- a/src/activities/notes/NotesActivity.cpp
++++ b/src/activities/notes/NotesActivity.cpp
+@@ -11,6 +11,11 @@
+ // constructor, and the HomeActivity/ActivityManager wiring around it are
+ // meant to stay as-is — only the body changes.
+ 
++void NotesActivity::onEnter() {
++  Activity::onEnter();
++  requestUpdateAndWait();
++}
++
+ void NotesActivity::loop() {
+   if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+     onGoHome();
+diff --git a/src/activities/notes/NotesActivity.h b/src/activities/notes/NotesActivity.h
+index c8dd71a..826b9c8 100644
+--- a/src/activities/notes/NotesActivity.h
++++ b/src/activities/notes/NotesActivity.h
+@@ -11,6 +11,7 @@ class NotesActivity final : public Activity {
+  public:
+   explicit NotesActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
+       : Activity("Notes", renderer, mappedInput) {}
++  void onEnter() override;
+   void loop() override;
+   void render(RenderLock&&) override;
+ };

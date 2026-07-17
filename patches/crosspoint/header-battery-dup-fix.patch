@@ -1,0 +1,22 @@
+diff --git a/src/activities/home/HomeActivity.cpp b/src/activities/home/HomeActivity.cpp
+index 6d9d381..f797bb3 100644
+--- a/src/activities/home/HomeActivity.cpp
++++ b/src/activities/home/HomeActivity.cpp
+@@ -226,6 +226,17 @@ void HomeActivity::render(RenderLock&&) {
+   renderer.clearScreen();
+   bool bufferRestored = coverBufferStored && restoreCoverBuffer();
+ 
++  if (bufferRestored) {
++    // restoreCoverBuffer() just pasted back a full-frame snapshot that may
++    // have an older header/battery baked into it (captured whenever
++    // storeCoverBuffer() last ran, inside drawRecentBookCover() below).
++    // drawHeader()'s own battery clear-rect is scoped to redrawing over
++    // itself frame-to-frame, not to erasing a stale header pasted back in
++    // from an older stored snapshot — clear the whole header strip first so
++    // nothing from that snapshot survives under the fresh draw.
++    renderer.fillRect(0, metrics.topPadding, pageWidth, metrics.homeTopPadding, false);
++  }
++
+   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.homeTopPadding}, nullptr);
+ 
+   GUI.drawRecentBookCover(renderer, Rect{0, metrics.homeTopPadding, pageWidth, metrics.homeCoverTileHeight},
